@@ -1,0 +1,202 @@
+"""Site-level artefact flags, per-cell genotype posteriors, and calibration against negative-control cells.
+
+Model per candidate site s and cell i (a = alt reads, d = depth):
+    wild type : a ~ Binomial(d, eps_s)            eps_s = site error, shrunk toward the error of its
+                                                  substitution type across all sites
+    mutant    : a ~ BetaBinomial(d, alpha, beta)  mean VAF ~ 0.5 by default, wide enough for allelic
+                                                  imbalance and partial dropout in single cells
+    P(mutant) = pi_s, fitted by EM per site
+The per-cell posterior P(mutant | a, d) is the output. Cells with d = 0 get no call.
+
+Calibration: when some cells are known not to carry the variants of interest (negative controls: another
+cell line, another donor, cells before an engineering step), the posterior threshold is chosen so the
+negative-control false-call rate stays below a target, and the report shows how many calls negatives get.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+from scipy.special import betaln, gammaln
+
+COMPLEMENT = str.maketrans("ACGT", "TGCA")
+
+
+def subst_type(ref: str, alt: str) -> str:
+    """Strand-collapsed substitution class, e.g. A>G and T>C -> T>C (pyrimidine reference)."""
+    if ref in "AG":
+        ref, alt = ref.translate(COMPLEMENT), alt.translate(COMPLEMENT)
+    return f"{ref}>{alt}"
+
+
+@dataclass
+class SiteFilters:
+    stranded_protocol: bool = False    # 10x 3'/5': reads come from one strand; strand bias is meaningless
+    max_strand_bias_p: float = 1e-3    # Fisher p for alt vs ref strand distribution
+    max_frac_near_end: float = 0.6     # alt reads within 10 nt of a read end
+    max_frac_near_junction: float = 0.5  # alt reads within 10 nt of a splice junction in the read
+    max_frac_near_clip: float = 0.5
+    min_mean_baseq: float = 25.0
+    germline_vaf: float = 0.3          # pooled VAF above this and present in most covered cells -> germline
+    germline_cell_frac: float = 0.6
+    editing_bed: str | None = None     # known RNA-editing sites (REDIportal etc.); A>G/T>C flagged if listed
+    flag_all_ag: bool = False          # flag every A>G / T>C as possible editing when no list is given
+
+
+def site_flags(sites: pd.DataFrame, A: np.ndarray, D: np.ndarray, f: SiteFilters | None = None) -> pd.DataFrame:
+    f = f or SiteFilters()
+    s = sites.copy()
+    alt_tot = A.sum(0)
+    dep_tot = D.sum(0)
+    cov = (D > 0).sum(0)
+    with_alt = (A > 0).sum(0)
+    s["depth"] = dep_tot
+    s["alt_total"] = alt_tot
+    s["vaf_pooled"] = np.where(dep_tot > 0, alt_tot / np.maximum(dep_tot, 1), np.nan)
+    s["cells_covered"] = cov
+    s["cells_alt"] = with_alt
+    s["subst"] = [subst_type(r, a) for r, a in zip(s.ref, s.alt)]
+    n_alt = np.maximum(alt_tot, 1)
+    flags = []
+    edit_sites = set()
+    if f.editing_bed:
+        bed = pd.read_csv(f.editing_bed, sep="\t", header=None, usecols=[0, 1], comment="#")
+        edit_sites = set(zip(bed[0].astype(str), bed[1].astype(int)))
+    for k in range(len(s)):
+        fl = []
+        if not f.stranded_protocol and alt_tot[k] >= 4:
+            p = stats.fisher_exact([[s.alt_fwd[k], s.alt_rev[k]], [s.ref_fwd[k] + 1, s.ref_rev[k] + 1]])[1]
+            one_sided = min(s.alt_fwd[k], s.alt_rev[k]) == 0 and alt_tot[k] >= 6
+            if p < f.max_strand_bias_p or one_sided:
+                fl.append("strand_bias")
+        if s.alt_near_end[k] / n_alt[k] > f.max_frac_near_end:
+            fl.append("read_end")
+        if s.alt_near_junction[k] / n_alt[k] > f.max_frac_near_junction:
+            fl.append("splice_junction")
+        if s.alt_near_clip[k] / n_alt[k] > f.max_frac_near_clip:
+            fl.append("soft_clip")
+        if alt_tot[k] and s.alt_baseq_sum[k] / alt_tot[k] < f.min_mean_baseq:
+            fl.append("low_baseq")
+        if "repeat_extension" in s.columns and s.repeat_extension[k]:
+            fl.append("repeat_extension")
+        if s.vaf_pooled[k] > f.germline_vaf and cov[k] > 0 and with_alt[k] / cov[k] > f.germline_cell_frac:
+            fl.append("germline_like")
+        if s.subst[k] == "T>C":
+            if (s.chrom[k], int(s.pos[k]) + 1) in edit_sites or (s.chrom[k], int(s.pos[k])) in edit_sites:
+                fl.append("rna_editing_known")
+            elif f.flag_all_ag:
+                fl.append("possible_editing")
+        flags.append(",".join(fl) if fl else "PASS")
+    s["filter"] = flags
+    return s
+
+
+def _betabinom_logpmf(a, d, al, be):
+    return (gammaln(d + 1) - gammaln(a + 1) - gammaln(d - a + 1)
+            + betaln(a + al, d - a + be) - betaln(al, be))
+
+
+def _binom_logpmf(a, d, p):
+    return stats.binom.logpmf(a, d, p)
+
+
+def substitution_error(sites: pd.DataFrame, A: np.ndarray, D: np.ndarray, max_vaf: float = 0.1) -> dict:
+    """Background error per substitution class: the median, over sites of that class, of the alt rate in cells
+    whose alt fraction is low (likely wild type). The median keeps a minority of artefact sites (editing,
+    hotspots) from inflating the background of their class."""
+    out = {}
+    low = (D > 0) & (A <= np.maximum(1, max_vaf * D))
+    a_site = (A * low).sum(0)
+    d_site = (D * low).sum(0)
+    rate = (a_site + 0.5) / (d_site + 500)
+    good = d_site >= 20
+    overall = float(np.median(rate[good])) if good.any() else 1e-3
+    for t, idx in sites.groupby("subst").groups.items():
+        idx = np.asarray(idx)
+        ok = d_site[idx] >= 20
+        cls = float(np.median(rate[idx][ok])) if ok.any() else overall
+        # a class dominated by one artefact (e.g. T>C full of editing sites) cannot set its own background
+        out[t] = min(cls, 3 * overall)
+    return out
+
+
+def call_cells(sites: pd.DataFrame, A: np.ndarray, D: np.ndarray, mut_mean: float = 0.5,
+               mut_conc: float = 4.0, prior_strength: float = 2000.0, n_iter: int = 50, min_depth: int = 2):
+    """Per-site EM; returns (posterior matrix cells x sites; NaN = not genotypable (depth < min_depth),
+    kept separate from wild type; site table with eps, pi)."""
+    sub_err = substitution_error(sites, A, D)
+    al, be = mut_mean * mut_conc, (1 - mut_mean) * mut_conc
+    post = np.full(A.shape, np.nan)
+    eps_out, pi_out, bg_out = [], [], []
+    for k in range(A.shape[1]):
+        a, d = A[:, k].astype(float), D[:, k].astype(float)
+        m = d >= min_depth
+        e0 = sub_err.get(sites.subst.iloc[k], 1e-3)
+        bg_out.append(e0)
+        if m.sum() == 0:
+            eps_out.append(e0)
+            pi_out.append(0.0)
+            continue
+        a, d = a[m], d[m]
+        pi, eps = 0.1, e0
+        for _ in range(n_iter):
+            l1 = np.log(pi) + _betabinom_logpmf(a, d, al, be)
+            l0 = np.log1p(-pi) + _binom_logpmf(a, d, eps)
+            mx = np.maximum(l0, l1)
+            r = np.exp(l1 - mx) / (np.exp(l0 - mx) + np.exp(l1 - mx))
+            pi_new = np.clip((r.sum() + 0.1) / (len(r) + 1.0), 1e-4, 0.999)
+            w = 1 - r
+            eps_new = ((w * a).sum() + prior_strength * e0) / ((w * d).sum() + prior_strength)
+            eps_new = float(np.clip(eps_new, 1e-6, 0.2))
+            if abs(pi_new - pi) < 1e-6 and abs(eps_new - eps) < 1e-9:
+                pi, eps = pi_new, eps_new
+                break
+            pi, eps = pi_new, eps_new
+        post[m, k] = r
+        eps_out.append(eps)
+        pi_out.append(pi)
+    s = sites.copy()
+    s["error_rate"] = eps_out
+    s["background_error"] = bg_out
+    s["frac_mutant"] = pi_out
+    return post, s
+
+
+def calibrate_threshold(post: np.ndarray, negative: np.ndarray, usable: np.ndarray, target_fp: float = 0.001,
+                        default: float = 0.9):
+    """Lowest posterior threshold whose false-call rate in negative-control cells (calls / covered
+    cell-site pairs) stays <= target_fp. Returns (threshold, table of threshold vs negative FP rate)."""
+    grid = np.array([0.5, 0.7, 0.8, 0.9, 0.95, 0.99, 0.999])
+    neg = post[negative][:, usable]
+    covered = np.isfinite(neg)
+    n = covered.sum()
+    rows = []
+    for t in grid:
+        calls = int((np.nan_to_num(neg, nan=0) >= t).sum())
+        rows.append({"threshold": t, "negative_calls": calls, "negative_pairs": int(n),
+                     "negative_fp_rate": calls / n if n else np.nan})
+    tab = pd.DataFrame(rows)
+    ok = tab[tab.negative_fp_rate <= target_fp]
+    thr = float(ok.threshold.min()) if len(ok) else float(grid.max())
+    return (thr if n else default), tab
+
+
+def split_check(A: np.ndarray, D: np.ndarray, sites: pd.DataFrame, usable: np.ndarray, threshold: float,
+                seed: int = 0):
+    """Reproducibility: split each cell's reads at each site into two random halves, call each half
+    separately, and report how often a call in one half is supported (alt reads > 0) in the other."""
+    rng = np.random.default_rng(seed)
+    A1 = rng.hypergeometric(np.maximum(A, 0), np.maximum(D - A, 0), D // 2) if A.size else A
+    D1 = D // 2
+    A2, D2 = A - A1, D - D1
+    p1, _ = call_cells(sites, A1, D1)
+    p2, _ = call_cells(sites, A2, D2)
+    c1 = (np.nan_to_num(p1, nan=0) >= threshold)[:, usable]
+    c2 = (np.nan_to_num(p2, nan=0) >= threshold)[:, usable]
+    both = ((D1 > 0) & (D2 > 0))[:, usable]
+    supported = ((c1 & both & (A2[:, usable] > 0)).sum() + (c2 & both & (A1[:, usable] > 0)).sum())
+    calls = (c1 & both).sum() + (c2 & both).sum()
+    return {"half_calls": int(calls), "supported_in_other_half": int(supported),
+            "support_rate": float(supported / calls) if calls else np.nan}

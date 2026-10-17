@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scmuta"
+version = "0.1.0.dev0"
+description = "Calibrated per-cell SNV calling from single-cell sequencing (negative-control calibration, artefact flags)"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Changhe Ji"}]
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.22", "scipy>=1.8", "pandas>=1.5", "pysam>=0.21"]
+
+[project.scripts]
+scmuta = "scmuta.cli:main"
+
+[tool.setuptools]
+packages = ["scmuta"]
