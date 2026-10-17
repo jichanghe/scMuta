@@ -12,7 +12,7 @@ from .util import log
 
 
 def run_counts(A, D, sites, cells, negative=None, filters: SiteFilters | None = None, target_fp=0.001,
-               threshold=None, min_alt_cells=2, neg_p=1e-3, seed=0, out=None, min_cell_alt=2):
+               threshold=None, min_alt_cells=2, neg_p=1e-3, seed=0, out=None, min_cell_alt=2, min_threshold=0.9):
     """A, D: cells x sites alt and depth counts. negative: boolean mask of negative-control cells (or None).
 
     Returns dict with site table, long call table, calibration table and summary."""
@@ -53,7 +53,10 @@ def run_counts(A, D, sites, cells, negative=None, filters: SiteFilters | None = 
         calib["negative_pairs"] = tabs[0].negative_pairs + tabs[1].negative_pairs
         calib["negative_fp_rate"] = calib.negative_calls / calib.negative_pairs.clip(lower=1)
         ok = calib[calib.negative_fp_rate <= target_fp]
-        thr = float(ok.threshold.min()) if len(ok) else float(calib.threshold.max())
+        thr_calibrated = float(ok.threshold.min()) if len(ok) else float(calib.threshold.max())
+        # the calibrated threshold can only raise the bar: when negatives give no calls at all, the lowest grid
+        # value passes, which is too permissive for cells outside the controls
+        thr = max(thr_calibrated, min_threshold)
         s.loc[bad_all & usable, "filter"] = "in_negative_controls"
         usable = usable & ~bad_all
     else:
@@ -78,6 +81,7 @@ def run_counts(A, D, sites, cells, negative=None, filters: SiteFilters | None = 
                "split_check": rep}
     if calib is not None:
         summary["negative_controls"] = int(negative.sum())
+        summary["threshold_calibrated"] = thr_calibrated
         row = calib[calib.threshold == thr]
         summary["held_out_negative_fp_rate"] = float(row.negative_fp_rate.iloc[0]) if len(row) else None
         # the pooled rate can hide a site where negatives are called; list those sites explicitly
