@@ -103,6 +103,8 @@ def discover(bams, fasta: str, regions, rf: ReadFilter | None = None, tag: str |
         refseq = ref.fetch(chrom, start, end).upper()
         for cell, path, t in inputs:
             for cb, r in _iter_reads(path, region, rf, t, keep_cells):
+                if r.has_tag("NM") and r.get_tag("NM") == 0:
+                    continue                      # no mismatch in this read: nothing to discover (most reads)
                 cid = cb if t else cell
                 q = r.query_qualities
                 seq = r.query_sequence
@@ -159,15 +161,28 @@ def count(bams, fasta: str, sites: pd.DataFrame, rf: ReadFilter | None = None, t
                 s0 = x
             prev = x
         windows.append((chrom, int(s0), int(prev) + 1))
+    sorted_pos = {c: np.array(sorted({p for (cc, p) in by_pos if cc == c})) for c in sites.chrom.unique()}
     for cell, path, t in inputs:
         for region in windows:
+            sp = sorted_pos[region[0]]
             for cb, r in _iter_reads(path, region, rf, t, keep_cells):
+                # candidate sites inside this read's aligned blocks (most reads in a window cover none)
+                here = []
+                for b0, b1 in r.get_blocks():
+                    i0, i1 = np.searchsorted(sp, b0), np.searchsorted(sp, b1)
+                    if i1 > i0:
+                        here.extend(sp[i0:i1].tolist())
+                if not here:
+                    continue
+                here = set(here)
                 cid = cb if t else cell
                 q = r.query_qualities
                 seq = r.query_sequence
                 edges, clips = _junction_and_clip_distance(r)
                 qlen = r.query_length
                 for qp, rp in r.get_aligned_pairs(matches_only=True):
+                    if rp not in here:
+                        continue
                     hits = by_pos.get((region[0], rp))
                     if not hits or q[qp] < rf.min_baseq:
                         continue

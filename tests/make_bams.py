@@ -36,7 +36,16 @@ def build(d, n_mut=8, n_wt=8, n_ctrl=8, reads=12, seed=0):
                 a.mapping_quality = 60
                 a.cigar = cigar
                 a.query_qualities = pysam.qualitystring_to_array("I" * len(seq))
-                a.set_tag("NM", 0)
+                # true mismatch count vs the reference, as aligners write it
+                nm, qp, rp = 0, 0, start
+                for op, ln in cigar:
+                    if op == 0:
+                        nm += sum(seq[qp + x] != ref[rp + x] for x in range(ln))
+                        qp += ln
+                        rp += ln
+                    elif op == 3:
+                        rp += ln
+                a.set_tag("NM", nm)
                 recs.append(a)
 
             for j in range(reads):
