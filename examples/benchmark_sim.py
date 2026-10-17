@@ -28,7 +28,7 @@ for seed in range(5):
     rows.append(dict(seed=seed, method="naive VAF>=0.2, >=2 alt", precision=p, recall=r, **sfp))
     for neg, name in ((None, "scMuta, no controls"), (sim["is_ctrl"], "scMuta + negative controls")):
         res = run_counts(A, D, sim["sites"], sim["cells"], negative=neg)
-        post = np.nan_to_num(res["posterior"], nan=0) >= res["summary"]["threshold"]
+        post = np.nan_to_num(res["posterior_call"], nan=0) >= res["summary"]["threshold"]
         called = post & res["sites"].variant.to_numpy()[None, :]
         p, r, sfp = score(called, cov_truth, kinds)
         rows.append(dict(seed=seed, method=name, precision=p, recall=r, **sfp))

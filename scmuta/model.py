@@ -35,6 +35,7 @@ def subst_type(ref: str, alt: str) -> str:
 class SiteFilters:
     stranded_protocol: bool = False    # 10x 3'/5': reads come from one strand; strand bias is meaningless
     max_strand_bias_p: float = 1e-3    # Fisher p for alt vs ref strand distribution
+    min_strand_shift: float = 0.25     # ... and the forward fraction of alt reads must differ from ref by this
     max_frac_near_end: float = 0.6     # alt reads within 10 nt of a read end
     max_frac_near_junction: float = 0.5  # alt reads within 10 nt of a splice junction in the read
     max_frac_near_clip: float = 0.5
@@ -68,8 +69,13 @@ def site_flags(sites: pd.DataFrame, A: np.ndarray, D: np.ndarray, f: SiteFilters
         fl = []
         if not f.stranded_protocol and alt_tot[k] >= 4:
             p = stats.fisher_exact([[s.alt_fwd[k], s.alt_rev[k]], [s.ref_fwd[k] + 1, s.ref_rev[k] + 1]])[1]
+            # a p-value alone flags real variants at high depth for small imbalances; also require a large shift
+            f_alt = s.alt_fwd[k] / max(s.alt_fwd[k] + s.alt_rev[k], 1)
+            f_ref = (s.ref_fwd[k] + 1) / (s.ref_fwd[k] + s.ref_rev[k] + 2)
+            if s.ref_fwd[k] + s.ref_rev[k] < 10:   # homozygous / few ref reads: compare with an even split
+                f_ref = 0.5
             one_sided = min(s.alt_fwd[k], s.alt_rev[k]) == 0 and alt_tot[k] >= 6
-            if p < f.max_strand_bias_p or one_sided:
+            if (p < f.max_strand_bias_p and abs(f_alt - f_ref) > f.min_strand_shift) or one_sided:
                 fl.append("strand_bias")
         if s.alt_near_end[k] / n_alt[k] > f.max_frac_near_end:
             fl.append("read_end")
@@ -162,6 +168,16 @@ def call_cells(sites: pd.DataFrame, A: np.ndarray, D: np.ndarray, mut_mean: floa
     s["background_error"] = bg_out
     s["frac_mutant"] = pi_out
     return post, s
+
+
+def callable_posterior(post: np.ndarray, A: np.ndarray, min_cell_alt: int = 2) -> np.ndarray:
+    """Posterior used for calls: a cell with fewer than min_cell_alt alt reads cannot be called mutant
+    (one read is as likely to be a stray read from another cell - index hopping, plate cross-contamination -
+    as a mutant allele). The cell stays genotyped (not NaN): it is called wild type or left uncalled."""
+    out = post.copy()
+    low = (A < min_cell_alt) & np.isfinite(post)
+    out[low] = np.minimum(out[low], 0.0)
+    return out
 
 
 def calibrate_threshold(post: np.ndarray, negative: np.ndarray, usable: np.ndarray, target_fp: float = 0.001,

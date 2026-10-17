@@ -91,15 +91,24 @@ def main():
                      min_alt_cells=1, out=a.out)
     st = res["sites"]
     print("\nscMuta sites:")
-    print(st[["pos", "ref", "alt", "filter", "vaf_pooled", "cells_called"]].assign(pos=st.pos + 1).to_string(index=False))
+    print(st[["pos", "ref", "alt", "filter", "vaf_pooled", "cells_called", "negative_cells_called"]]
+          .assign(pos=st.pos + 1).to_string(index=False))
 
     # 6. truth check at the P525L site
     k = int(np.flatnonzero((st.pos == EXPECTED[1] - 1).to_numpy())[0])
-    post = res["posterior"][:, k]
+    post = res["posterior_call"][:, k]
     thr = res["summary"]["threshold"]
-    out = pd.DataFrame({"cell": cells, "group": grp, "alt": A[:, k], "depth": D[:, k], "posterior": post})
+    out = pd.DataFrame({"cell": cells, "group": grp, "alt": A[:, k], "depth": D[:, k],
+                        "posterior_model": res["posterior"][:, k], "posterior": post})
+    # the second (silent) knock-in edit, 4 nt downstream: does each cell agree at both sites?
+    k2 = np.flatnonzero(((st.pos == EXPECTED[1] + 3) & (st.alt == "C")).to_numpy())
+    if len(k2):
+        out["alt_31191435"], out["depth_31191435"] = A[:, k2[0]], D[:, k2[0]]
     out["call"] = np.where(np.isnan(post), "not_genotypable", np.where(post >= thr, "mutant", "wild_type"))
     out.to_csv(os.path.join(a.out, "p525l_cells.tsv"), sep="\t", index=False)
+    odd = out[((out.group == "Control") & (out.alt > 0)) | ((out.group == "P525L") & (out.call != "mutant"))]
+    print("\nCells that disagree with their label or carry any alt read in controls:")
+    print(odd.to_string(index=False))
     print(f"\nP525L site: filter={st['filter'][k]}, threshold={thr}")
     print(pd.crosstab(out.group, out.call, margins=True).to_string())
     tab = {gname: out[out.group == gname].call.value_counts().to_dict() for gname in ["P525L", "Control", "KO"]}

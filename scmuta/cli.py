@@ -52,6 +52,7 @@ def main(argv=None):
     c.add_argument("--threshold", type=float, default=None, help="fixed posterior threshold (overrides calibration)")
     c.add_argument("--min-alt-reads", type=int, default=3)
     c.add_argument("--min-alt-cells", type=int, default=2)
+    c.add_argument("--min-cell-alt", type=int, default=2, help="alt reads a cell needs to be called mutant")
     c.add_argument("--min-mapq", type=int, default=20)
     c.add_argument("--min-baseq", type=int, default=20)
     c.add_argument("--umi-tag", default="UB", help="UMI tag for --dedup umi (droplet)")
@@ -86,7 +87,8 @@ def main(argv=None):
         neg = np.array([c in negset for c in cells])
     filters = SiteFilters(stranded_protocol=a.stranded, editing_bed=a.editing_bed, flag_all_ag=a.flag_all_ag)
     res = run_counts(A, D, s, cells, negative=neg, filters=filters, target_fp=a.target_fp, threshold=a.threshold,
-                     min_alt_cells=1 if a.sites else a.min_alt_cells, out=a.out)
+                     min_alt_cells=1 if a.sites else a.min_alt_cells, out=a.out,
+                     min_cell_alt=a.min_cell_alt)
     if a.truth:
         tr = pd.read_csv(a.truth).set_index(pd.read_csv(a.truth).columns[0]).iloc[:, 0]
         called = set(res["calls"].cell)

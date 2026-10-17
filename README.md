@@ -29,7 +29,7 @@ mean of 5 seeds):
 | Method | Cell-level precision | Recall | Editing sites called (of 30) | Germline (of 40) | Strand / junction (of 20 each) |
 |---|---|---|---|---|---|
 | Naive per-cell VAF ≥ 0.2, ≥ 2 alt reads | 0.17 | 0.70 | 30 | 40 | 20 / 20 |
-| scMuta, no negative controls | 0.51 | 0.74 | 30 | 0.2 | 0 / 0 |
+| scMuta, no negative controls | 0.52 | 0.70 | 30 | 0.2 | 0 / 0 |
 | **scMuta + negative controls** | **0.997** | 0.62 | 0.4 | 0 | 0 / 0 |
 
 Artefact flags remove germline, strand and junction artefacts; **RNA editing is only removed when negative
@@ -54,7 +54,10 @@ Outputs: `sites.tsv` (flags, error, cells called), `cell_calls.tsv` (cell, site,
 
 ## Roadmap
 
-- [ ] Real-data ground truth: FUS P525L knock-in Smart-seq2 cells (known site, control line as negatives);
+- [x] First real-data truth test: FUS P525L knock-in Smart-seq2 (49/50 carriers, 47/48 controls; found the silent
+      Y526 blocking edit blind) - `examples/fus_p525l.py`
+- [ ] Stray-read (index hopping / cross-contamination) rate per site estimated from negatives
+- [ ] More ground truth:
       public cell-line mixtures (HapMap / SMaHT), GoT / TARGET-seq data
 - [ ] Germline heterozygous SNPs for allele-specific expression and dropout per cell (SCAN2-style)
 - [ ] Editing modelled as a probability (cluster-wide, A>G context) rather than only screened

@@ -7,17 +7,18 @@ import os
 import numpy as np
 import pandas as pd
 
-from .model import SiteFilters, calibrate_threshold, call_cells, site_flags, split_check
+from .model import SiteFilters, calibrate_threshold, call_cells, callable_posterior, site_flags, split_check
 from .util import log
 
 
 def run_counts(A, D, sites, cells, negative=None, filters: SiteFilters | None = None, target_fp=0.001,
-               threshold=None, min_alt_cells=2, neg_p=1e-3, seed=0, out=None):
+               threshold=None, min_alt_cells=2, neg_p=1e-3, seed=0, out=None, min_cell_alt=2):
     """A, D: cells x sites alt and depth counts. negative: boolean mask of negative-control cells (or None).
 
     Returns dict with site table, long call table, calibration table and summary."""
     s = site_flags(sites, A, D, filters)
     post, s = call_cells(s, A, D)
+    post_call = callable_posterior(post, A, min_cell_alt)
     usable = (s["filter"] == "PASS").to_numpy()
     calib = None
     case = np.ones(len(cells), bool)
@@ -46,7 +47,7 @@ def run_counts(A, D, sites, cells, negative=None, filters: SiteFilters | None = 
             other_bad = screen(folds[1 - k])[0]
             held = np.zeros(len(cells), bool)
             held[folds[k]] = True
-            tabs.append(calibrate_threshold(post, held, usable & ~other_bad, target_fp)[1])
+            tabs.append(calibrate_threshold(post_call, held, usable & ~other_bad, target_fp)[1])
         calib = tabs[0].copy()
         calib["negative_calls"] = tabs[0].negative_calls + tabs[1].negative_calls
         calib["negative_pairs"] = tabs[0].negative_pairs + tabs[1].negative_pairs
@@ -59,10 +60,11 @@ def run_counts(A, D, sites, cells, negative=None, filters: SiteFilters | None = 
         thr = 0.9
     if threshold is not None:
         thr = threshold
-    called = (np.nan_to_num(post, nan=0) >= thr)
+    called = (np.nan_to_num(post_call, nan=0) >= thr)
     s["cells_called"] = called[case].sum(0)
     if negative is not None and negative.any():
         s["negative_cells_called"] = called[negative].sum(0)
+        s["negative_cells_covered"] = (D[negative] >= 2).sum(0)
     # a site needs calls in >= min_alt_cells cells of interest to be reported as a variant
     s["variant"] = usable & (s["cells_called"] >= min_alt_cells)
     rep = split_check(A, D, s, s["variant"].to_numpy(), thr)
@@ -78,6 +80,9 @@ def run_counts(A, D, sites, cells, negative=None, filters: SiteFilters | None = 
         summary["negative_controls"] = int(negative.sum())
         row = calib[calib.threshold == thr]
         summary["held_out_negative_fp_rate"] = float(row.negative_fp_rate.iloc[0]) if len(row) else None
+        # the pooled rate can hide a site where negatives are called; list those sites explicitly
+        bad = s[s["variant"] & (s["negative_cells_called"] > 0)]
+        summary["variant_sites_with_negative_calls"] = int(len(bad))
     log(f"variants: {summary['variants']} (of {len(s)} candidates; {usable.sum()} pass filters); "
         f"{len(calls)} cell calls at posterior >= {thr}")
     if out:
@@ -88,4 +93,4 @@ def run_counts(A, D, sites, cells, negative=None, filters: SiteFilters | None = 
             calib.to_csv(os.path.join(out, "calibration.tsv"), sep="\t", index=False)
         with open(os.path.join(out, "summary.json"), "w") as fh:
             json.dump(summary, fh, indent=2, default=float)
-    return {"sites": s, "calls": calls, "posterior": post, "calibration": calib, "summary": summary}
+    return {"sites": s, "calls": calls, "posterior": post, "posterior_call": post_call, "calibration": calib, "summary": summary}
