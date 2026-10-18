@@ -16,7 +16,7 @@ for each step, then measure false calls directly on real cells that cannot carry
 | Molecules, not reads | `--dedup umi` (droplet) or `start` (plate) | mtDNA single-molecule critique |
 | Artefact flags | strand bias, read-end position, **splice-junction proximity**, soft-clip, base quality, repeat extension (YY[X]YY > Y), known RNA-editing sites, germline-like sites | SComatic, Wiens et al. 2024, scSplicer |
 | Per-cell genotype | Mixture per site: wild type = Binomial(error), mutant = Beta-Binomial (allelic imbalance / dropout); error shrunk to a robust per-substitution background; EM | SComatic, scMitoMut, SC-BIG |
-| Three states | mutant / wild type / **not genotypable** (too few reads), never merged | gap in current tools |
+| Four states | mutant / wild type (reads favour wild type >= 10:1) / **uncertain** / **not genotypable**; mutant VAF learned per site | gap in current tools |
 | **Negative-control calibration** | Cells that cannot carry the variants (another line, donor, unedited cells) screen out sites with excess alt reads (editing, hotspots, germline) and set the posterior threshold; cross-fitted so the reported false-call rate is measured on cells that did not screen those sites | SCEPTRE-style empirical nulls; scSplicer |
 | Reproducibility | Each cell's reads split in two; calls in one half checked for support in the other | scSplicer split checks |
 
@@ -29,7 +29,7 @@ mean of 5 seeds):
 | Method | Cell-level precision | Recall | Editing sites called (of 30) | Germline (of 40) | Strand / junction (of 20 each) |
 |---|---|---|---|---|---|
 | Naive per-cell VAF ≥ 0.2, ≥ 2 alt reads | 0.17 | 0.70 | 30 | 40 | 20 / 20 |
-| scMuta, no negative controls | 0.52 | 0.70 | 30 | 0.2 | 0 / 0 |
+| scMuta, no negative controls | 0.50 | 0.70 | 30 | 0.2 | 0 / 0 |
 | **scMuta + negative controls** | **0.997** | 0.62 | 0.4 | 0 | 0 / 0 |
 
 Artefact flags remove germline, strand and junction artefacts; **RNA editing is only removed when negative

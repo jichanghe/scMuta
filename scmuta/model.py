@@ -129,13 +129,17 @@ def substitution_error(sites: pd.DataFrame, A: np.ndarray, D: np.ndarray, max_va
 
 
 def call_cells(sites: pd.DataFrame, A: np.ndarray, D: np.ndarray, mut_mean: float = 0.5,
-               mut_conc: float = 4.0, prior_strength: float = 2000.0, n_iter: int = 50, min_depth: int = 2):
+               mut_conc: float = 4.0, prior_strength: float = 2000.0, n_iter: int = 50, min_depth: int = 2,
+               learn_vaf: bool = True, vaf_prior: float = 20.0):
     """Per-site EM; returns (posterior matrix cells x sites; NaN = not genotypable (depth < min_depth),
-    kept separate from wild type; site table with eps, pi)."""
+    kept separate from wild type; site table with eps, pi, mutant VAF).
+
+    learn_vaf: the mutant allele fraction of each site is estimated from the cells assigned to the mutant state
+    (shrunk toward mut_mean with vaf_prior pseudo-reads), so a cell with few reads is judged against what this
+    mutation looks like (e.g. ~0.97 for a homozygous edit, ~0.5 for a heterozygous somatic SNV)."""
     sub_err = substitution_error(sites, A, D)
-    al, be = mut_mean * mut_conc, (1 - mut_mean) * mut_conc
     post = np.full(A.shape, np.nan)
-    eps_out, pi_out, bg_out = [], [], []
+    eps_out, pi_out, bg_out, vaf_out = [], [], [], []
     for k in range(A.shape[1]):
         a, d = A[:, k].astype(float), D[:, k].astype(float)
         m = d >= min_depth
@@ -144,10 +148,12 @@ def call_cells(sites: pd.DataFrame, A: np.ndarray, D: np.ndarray, mut_mean: floa
         if m.sum() == 0:
             eps_out.append(e0)
             pi_out.append(0.0)
+            vaf_out.append(mut_mean)
             continue
         a, d = a[m], d[m]
-        pi, eps = 0.1, e0
+        pi, eps, mu = 0.1, e0, mut_mean
         for _ in range(n_iter):
+            al, be = mu * mut_conc, (1 - mu) * mut_conc
             l1 = np.log(pi) + _betabinom_logpmf(a, d, al, be)
             l0 = np.log1p(-pi) + _binom_logpmf(a, d, eps)
             mx = np.maximum(l0, l1)
@@ -156,6 +162,8 @@ def call_cells(sites: pd.DataFrame, A: np.ndarray, D: np.ndarray, mut_mean: floa
             w = 1 - r
             eps_new = ((w * a).sum() + prior_strength * e0) / ((w * d).sum() + prior_strength)
             eps_new = float(np.clip(eps_new, 1e-6, 0.2))
+            if learn_vaf:
+                mu = float(np.clip(((r * a).sum() + vaf_prior * mut_mean) / ((r * d).sum() + vaf_prior), 0.4, 0.98))
             if abs(pi_new - pi) < 1e-6 and abs(eps_new - eps) < 1e-9:
                 pi, eps = pi_new, eps_new
                 break
@@ -163,11 +171,33 @@ def call_cells(sites: pd.DataFrame, A: np.ndarray, D: np.ndarray, mut_mean: floa
         post[m, k] = r
         eps_out.append(eps)
         pi_out.append(pi)
+        vaf_out.append(mu)
     s = sites.copy()
     s["error_rate"] = eps_out
     s["background_error"] = bg_out
     s["frac_mutant"] = pi_out
+    s["mutant_vaf"] = vaf_out
     return post, s
+
+
+def genotype_calls(post: np.ndarray, post_call: np.ndarray, threshold: float, frac_mutant,
+                   wt_bayes_factor: float = 10.0) -> np.ndarray:
+    """Four states per cell and site:
+      mutant          callable posterior >= threshold
+      wild_type       the cell's own reads favour wild type over the site's mutant model by >= wt_bayes_factor
+                      (independent of how common the mutation is at the site)
+      uncertain       neither: e.g. 2 reference reads at a site whose mutant VAF is 0.7, or a single alt read
+      not_genotypable too few reads
+    frac_mutant: per-site mixing proportion from call_cells (to turn posteriors back into likelihood ratios)."""
+    pi = np.clip(np.broadcast_to(np.asarray(frac_mutant, float), post.shape), 1e-6, 1 - 1e-6)
+    out = np.full(post.shape, "uncertain", dtype=object)
+    out[np.isnan(post)] = "not_genotypable"
+    fin = np.isfinite(post)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        bf_wt = pi * (1 - post) / ((1 - pi) * post)       # L(wild type) / L(mutant)
+    out[fin & (np.nan_to_num(bf_wt, nan=0, posinf=np.inf) >= wt_bayes_factor)] = "wild_type"
+    out[fin & (np.nan_to_num(post_call, nan=0) >= threshold)] = "mutant"
+    return out
 
 
 def callable_posterior(post: np.ndarray, A: np.ndarray, min_cell_alt: int = 2) -> np.ndarray:

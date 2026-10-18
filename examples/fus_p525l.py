@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import pysam
 
-from scmuta.model import SiteFilters
+from scmuta.model import SiteFilters, genotype_calls
 from scmuta.pileup import ReadFilter, count, discover
 from scmuta.pipeline import run_counts
 
@@ -104,7 +104,7 @@ def main():
     k2 = np.flatnonzero(((st.pos == EXPECTED[1] + 3) & (st.alt == "C")).to_numpy())
     if len(k2):
         out["alt_31191435"], out["depth_31191435"] = A[:, k2[0]], D[:, k2[0]]
-    out["call"] = np.where(np.isnan(post), "not_genotypable", np.where(post >= thr, "mutant", "wild_type"))
+    out["call"] = genotype_calls(res["posterior"][:, [k]], post[:, None], thr, st["frac_mutant"][k])[:, 0]
     out.to_csv(os.path.join(a.out, "p525l_cells.tsv"), sep="\t", index=False)
     odd = out[((out.group == "Control") & (out.alt > 0)) | ((out.group == "P525L") & (out.call != "mutant"))]
     print("\nCells that disagree with their label or carry any alt read in controls:")

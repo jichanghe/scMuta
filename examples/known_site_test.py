@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import pysam
 
-from scmuta.model import SiteFilters
+from scmuta.model import SiteFilters, genotype_calls
 from scmuta.pileup import ReadFilter, count, discover
 from scmuta.pipeline import run_counts
 
@@ -111,12 +111,17 @@ def main():
         post = res["posterior_call"][:, k]
         out = pd.DataFrame({"cell": cells, "group": grp, "alt": A[:, k], "depth": D[:, k],
                             "posterior_model": res["posterior"][:, k], "posterior": post})
-        out["call"] = np.where(np.isnan(post), "not_genotypable", np.where(post >= thr, "mutant", "wild_type"))
+        out["call"] = genotype_calls(res["posterior"][:, [k]], post[:, None], thr, st["frac_mutant"][k])[:, 0]
         out.to_csv(os.path.join(a.out, f"{kn['name']}_cells.tsv"), sep="\t", index=False)
-        print(f"\n=== {kn['name']} ({kn.chrom}:{kn.pos + 1} {kn.ref}>{kn.alt}), filter={st['filter'][k]}")
+        print(f"\n=== {kn['name']} ({kn.chrom}:{kn.pos + 1} {kn.ref}>{kn.alt}), filter={st['filter'][k]}, "
+              f"mutant VAF={st['mutant_vaf'][k]:.2f}")
+        if "germline_like" in st["filter"][k]:
+            print("note: germline_like is expected when carriers and negatives are different individuals: a mutation in "
+                  "every carrier cell looks like a germline SNP of that individual; only same-individual controls "
+                  "(isogenic lines, matched normal cells) can tell them apart. Cell-level calls are still reported.")
         print(pd.crosstab(out.group, out.call, margins=True).to_string())
         odd = out[(np.isin(out.group, negatives) & (out.call == "mutant")) |
-                  (np.isin(out.group, carriers) & (out.call == "wild_type"))]
+                  (np.isin(out.group, carriers) & (out.call != "mutant") & (out.call != "not_genotypable"))]
         if len(odd):
             print("cells disagreeing with their label:")
             print(odd.to_string(index=False))
