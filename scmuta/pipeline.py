@@ -7,7 +7,8 @@ import os
 import numpy as np
 import pandas as pd
 
-from .model import SiteFilters, calibrate_threshold, call_cells, callable_posterior, site_flags, split_check
+from .model import (SiteFilters, calibrate_threshold, call_cells, callable_posterior, site_flags, site_low_vaf_counts,
+                    split_check, subst_type, substitution_error_from_sums)
 from .util import log
 
 
@@ -98,3 +99,105 @@ def run_counts(A, D, sites, cells, negative=None, filters: SiteFilters | None = 
         with open(os.path.join(out, "summary.json"), "w") as fh:
             json.dump(summary, fh, indent=2, default=float)
     return {"sites": s, "calls": calls, "posterior": post, "posterior_call": post_call, "calibration": calib, "summary": summary}
+
+
+def run_counts_chunked(A, D, sites, cells, negative, filters: SiteFilters | None = None, target_fp=0.001,
+                       min_alt_cells=2, neg_p=1e-3, seed=0, out=None, min_cell_alt=2, min_threshold=0.9,
+                       chunk=1500):
+    """Memory-light version of run_counts for large sparse data (e.g. 10x snRNA: 10^4-10^5 cells x 10^4-10^5
+    sites). A, D: scipy sparse (cells x sites). Sites are processed in blocks; the negative-control calibration is
+    pooled over all blocks before the threshold is chosen, so it is the same procedure as run_counts."""
+    from scipy import sparse, stats
+    A = sparse.csc_matrix(A)
+    D = sparse.csc_matrix(D)
+    negative = np.asarray(negative, bool)
+    case = ~negative
+    rng = np.random.default_rng(seed)
+    neg_idx = np.flatnonzero(negative)
+    rng.shuffle(neg_idx)
+    folds = [neg_idx[: len(neg_idx) // 2], neg_idx[len(neg_idx) // 2:]]
+    held = [np.isin(np.arange(len(cells)), f) for f in folds]
+    grid = np.array([0.5, 0.7, 0.8, 0.9, 0.95, 0.99, 0.999])
+    neg_calls = np.zeros((2, len(grid)))
+    neg_pairs = np.zeros(2)
+    blocks = []
+    sites = sites.reset_index(drop=True)
+    # background error per substitution class from ALL sites (so the block size cannot change results)
+    a_low, d_low = np.zeros(len(sites)), np.zeros(len(sites))
+    for b0 in range(0, len(sites), chunk):
+        sl = slice(b0, min(len(sites), b0 + chunk))
+        a_low[sl], d_low[sl] = site_low_vaf_counts(A[:, sl].toarray(), D[:, sl].toarray())
+    subst = [subst_type(r, a_) for r, a_ in zip(sites.ref, sites.alt)]
+    sub_err = substitution_error_from_sums(subst, a_low, d_low)
+    for b0 in range(0, len(sites), chunk):
+        sl = slice(b0, min(len(sites), b0 + chunk))
+        a = A[:, sl].toarray()
+        d = D[:, sl].toarray()
+        s = site_flags(sites.iloc[sl].reset_index(drop=True), a, d, filters)
+        post, s = call_cells(s, a, d, sub_err=sub_err)
+        pc = callable_posterior(post, a, min_cell_alt)
+        usable = (s["filter"] == "PASS").to_numpy()
+        bg = 2 * s["background_error"].to_numpy()
+
+        def screen(idx):
+            a_n, d_n = a[idx].sum(0), d[idx].sum(0)
+            p = stats.binom.sf(a_n - 1, d_n, bg)
+            return (p < neg_p) & (a_n >= 2), a_n, d_n, p
+
+        bad_all, a_n, d_n, p_neg = screen(neg_idx)
+        s["negative_alt_reads"], s["negative_depth"], s["negative_p"] = a_n, d_n, p_neg
+        for k in (0, 1):
+            other_bad = screen(folds[1 - k])[0]
+            u = usable & ~other_bad
+            sub = pc[held[k]][:, u]
+            cov = np.isfinite(sub)
+            neg_pairs[k] += cov.sum()
+            sub0 = np.nan_to_num(sub, nan=0)
+            neg_calls[k] += [(sub0 >= t).sum() for t in grid]
+        s.loc[bad_all & usable, "filter"] = "in_negative_controls"
+        # keep posteriors sparsely (only covered cell-site pairs)
+        rows, cols = np.nonzero(np.isfinite(pc))
+        blocks.append((sl, s, sparse.csc_matrix((pc[rows, cols], (rows, cols)), shape=pc.shape),
+                       sparse.csc_matrix((post[rows, cols] + 1e-12, (rows, cols)), shape=post.shape)))
+        log(f"sites {sl.start}-{sl.stop} of {len(sites)}")
+    rate = neg_calls.sum(0) / max(neg_pairs.sum(), 1)
+    calib = pd.DataFrame({"threshold": grid, "negative_calls": neg_calls.sum(0).astype(int),
+                          "negative_pairs": int(neg_pairs.sum()), "negative_fp_rate": rate})
+    ok = calib[calib.negative_fp_rate <= target_fp]
+    thr_cal = float(ok.threshold.min()) if len(ok) else float(grid.max())
+    thr = max(thr_cal, min_threshold)
+    site_tabs, call_tabs = [], []
+    for sl, s, pcs, _ in blocks:
+        called = (pcs >= thr).toarray()
+        s["cells_called"] = called[case].sum(0)
+        s["negative_cells_called"] = called[negative].sum(0)
+        s["variant"] = (s["filter"] == "PASS").to_numpy() & (s["cells_called"] >= min_alt_cells)
+        ii, kk = np.nonzero(called & s["variant"].to_numpy()[None, :] & case[:, None])
+        if len(ii):
+            a_ = A[:, sl]
+            d_ = D[:, sl]
+            call_tabs.append(pd.DataFrame({
+                "cell": np.asarray(cells)[ii], "chrom": s.chrom.to_numpy()[kk], "pos": s.pos.to_numpy()[kk],
+                "ref": s.ref.to_numpy()[kk], "alt": s.alt.to_numpy()[kk],
+                "alt_reads": np.asarray(a_[ii, kk]).ravel(), "depth": np.asarray(d_[ii, kk]).ravel(),
+                "posterior": np.asarray(pcs[ii, kk]).ravel()}))
+        site_tabs.append(s)
+    st = pd.concat(site_tabs, ignore_index=True)
+    calls = pd.concat(call_tabs, ignore_index=True) if call_tabs else pd.DataFrame(
+        columns=["cell", "chrom", "pos", "ref", "alt", "alt_reads", "depth", "posterior"])
+    summary = {"cells": len(cells), "candidate_sites": int(len(st)),
+               "pass_filters": int((st["filter"] == "PASS").sum()), "variants": int(st["variant"].sum()),
+               "cell_calls": int(len(calls)), "threshold": thr, "threshold_calibrated": thr_cal,
+               "negative_controls": int(negative.sum()),
+               "held_out_negative_fp_rate": float(rate[grid == thr][0]) if (grid == thr).any() else None,
+               "variant_sites_with_negative_calls": int((st["variant"] & (st["negative_cells_called"] > 0)).sum()),
+               "filters": st["filter"].str.split(",").explode().value_counts().to_dict()}
+    log(f"variants: {summary['variants']} (of {len(st)} candidates); {len(calls)} cell calls at posterior >= {thr}")
+    if out:
+        os.makedirs(out, exist_ok=True)
+        st.to_csv(os.path.join(out, "sites.tsv"), sep="\t", index=False)
+        calls.to_csv(os.path.join(out, "cell_calls.tsv"), sep="\t", index=False)
+        calib.to_csv(os.path.join(out, "calibration.tsv"), sep="\t", index=False)
+        with open(os.path.join(out, "summary.json"), "w") as fh:
+            json.dump(summary, fh, indent=2, default=float)
+    return {"sites": st, "calls": calls, "calibration": calib, "summary": summary}

@@ -26,7 +26,8 @@ from scipy import io, sparse
 
 from scmuta.model import SiteFilters
 from scmuta.pileup import ReadFilter, count, discover
-from scmuta.pipeline import run_counts
+from scmuta.pipeline import run_counts_chunked
+from scipy import sparse as sp
 from scmuta.util import log
 
 MARKERS = {
@@ -108,6 +109,9 @@ def coverage(bam, cells, chroms, step=10, chunk=1_000_000, rf=None):
 
 
 def main():
+    import functools, builtins
+    global print
+    print = functools.partial(builtins.print, flush=True)   # results appear even if the run is interrupted
     ap = argparse.ArgumentParser()
     ap.add_argument("--donor", action="append", required=True, help="NAME:STARsolo_folder (repeat)")
     ap.add_argument("--fasta", required=True)
@@ -176,16 +180,17 @@ def main():
     for d, _ in donors:
         keep = set(meta.barcode[meta.donor == d])
         A, D, s, cells = count(bams[d], a.fasta, sites, rf, "CB", keep, umi_tag="UB", dedup="umi")
-        # count() returns only cells with reads at candidate sites, in sorted order; align to all nuclei
+        # count() returns only cells with reads at candidate sites, in sorted order; align to all nuclei (sparse:
+        # each nucleus covers few sites, so dense cells x sites matrices would not fit in memory)
+        A, D = sp.csr_matrix(A), sp.csr_matrix(D)
         full = meta.barcode[meta.donor == d].tolist()
         idx = {c: i for i, c in enumerate(cells)}
-        A2 = np.zeros((len(full), len(sites)), np.int32)
-        D2 = np.zeros_like(A2)
-        for i, c in enumerate(full):
-            if c in idx:
-                A2[i], D2[i] = A[idx[c]], D[idx[c]]
-        As.append(A2)
-        Ds.append(D2)
+        rows = np.array([idx.get(c, -1) for c in full])
+        P = sp.csr_matrix((np.ones((rows >= 0).sum()), (np.flatnonzero(rows >= 0), rows[rows >= 0])),
+                          shape=(len(full), len(cells)))
+        As.append((P @ A).tocsr())
+        Ds.append((P @ D).tocsr())
+        del A, D
         cells_all += [f"{d}:{c}" for c in full]
         num = ["alt_fwd", "alt_rev", "ref_fwd", "ref_rev", "alt_near_end", "alt_near_junction", "alt_near_clip",
                "alt_baseq_sum"]
@@ -193,8 +198,9 @@ def main():
             feats = s.copy()
         else:
             feats[num] = feats[num].to_numpy() + s[num].to_numpy()
-    A = np.vstack(As)
-    D = np.vstack(Ds)
+    A = sp.vstack(As).tocsr()
+    D = sp.vstack(Ds).tocsr()
+    log(f"counts: {A.shape[0]} nuclei x {A.shape[1]} sites, {D.nnz} covered pairs ({D.nnz / np.prod(D.shape):.2e} filled)")
     cm = meta.set_index("cell").loc[cells_all]
     donor_of = cm.donor.to_numpy()
 
@@ -209,13 +215,13 @@ def main():
         n_types_cov = np.zeros(len(sites), int)
         for t in set(types_of[m]) - {"unassigned"}:
             mt = m & (types_of == t)
-            cov_t = (D[mt] > 0).sum(0)
-            alt_t = (A[mt] > 0).sum(0)
+            cov_t = np.asarray((D[mt] > 0).sum(0)).ravel()
+            alt_t = np.asarray((A[mt] > 0).sum(0)).ravel()
             ok = cov_t >= 3
             n_types_cov += ok
             n_types_alt += ok & (alt_t >= 0.3 * np.maximum(cov_t, 1))
-        a_, d_ = A[m].sum(0), D[m].sum(0)
-        cov_, alt_ = (D[m] > 0).sum(0), (A[m] > 0).sum(0)
+        a_, d_ = np.asarray(A[m].sum(0)).ravel(), np.asarray(D[m].sum(0)).ravel()
+        cov_, alt_ = np.asarray((D[m] > 0).sum(0)).ravel(), np.asarray((A[m] > 0).sum(0)).ravel()
         single = (n_types_cov <= 1) & (alt_ >= 0.5 * np.maximum(cov_, 1)) & (a_ >= 0.3 * np.maximum(d_, 1)) & (cov_ >= 3)
         germ[d] = (n_types_alt >= 2) | single
         log(f"donor {d}: {germ[d].sum()} germline-like alleles (heterozygous/homozygous SNPs)")
@@ -224,7 +230,7 @@ def main():
     for d, _ in donors:
         keep_sites = ~germ[d]
         neg = donor_of != d
-        res = run_counts(A[:, keep_sites], D[:, keep_sites], feats[keep_sites].reset_index(drop=True), cells_all,
+        res = run_counts_chunked(A[:, keep_sites], D[:, keep_sites], feats[keep_sites].reset_index(drop=True), cells_all,
                          negative=neg, filters=SiteFilters(stranded_protocol=True), target_fp=0.001,
                          min_alt_cells=2, out=os.path.join(a.out, f"scmuta_{d}"))
         st = res["sites"]

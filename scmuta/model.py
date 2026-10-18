@@ -108,6 +108,26 @@ def _binom_logpmf(a, d, p):
     return stats.binom.logpmf(a, d, p)
 
 
+def site_low_vaf_counts(A, D, max_vaf: float = 0.1):
+    """Per site: alt and depth summed over cells whose alt fraction is low (likely wild type)."""
+    low = (D > 0) & (A <= np.maximum(1, max_vaf * D))
+    return (A * low).sum(0), (D * low).sum(0)
+
+
+def substitution_error_from_sums(subst, a_site, d_site) -> dict:
+    rate = (a_site + 0.5) / (d_site + 500)
+    good = d_site >= 20
+    overall = float(np.median(rate[good])) if good.any() else 1e-3
+    out = {}
+    subst = pd.Series(np.asarray(subst))
+    for t, idx in subst.groupby(subst).groups.items():
+        idx = np.asarray(idx)
+        ok = d_site[idx] >= 20
+        cls = float(np.median(rate[idx][ok])) if ok.any() else overall
+        out[t] = min(cls, 3 * overall)
+    return out
+
+
 def substitution_error(sites: pd.DataFrame, A: np.ndarray, D: np.ndarray, max_vaf: float = 0.1) -> dict:
     """Background error per substitution class: the median, over sites of that class, of the alt rate in cells
     whose alt fraction is low (likely wild type). The median keeps a minority of artefact sites (editing,
@@ -130,14 +150,14 @@ def substitution_error(sites: pd.DataFrame, A: np.ndarray, D: np.ndarray, max_va
 
 def call_cells(sites: pd.DataFrame, A: np.ndarray, D: np.ndarray, mut_mean: float = 0.5,
                mut_conc: float = 4.0, prior_strength: float = 2000.0, n_iter: int = 50, min_depth: int = 2,
-               learn_vaf: bool = True, vaf_prior: float = 20.0):
+               learn_vaf: bool = True, vaf_prior: float = 20.0, sub_err: dict | None = None):
     """Per-site EM; returns (posterior matrix cells x sites; NaN = not genotypable (depth < min_depth),
     kept separate from wild type; site table with eps, pi, mutant VAF).
 
     learn_vaf: the mutant allele fraction of each site is estimated from the cells assigned to the mutant state
     (shrunk toward mut_mean with vaf_prior pseudo-reads), so a cell with few reads is judged against what this
     mutation looks like (e.g. ~0.97 for a homozygous edit, ~0.5 for a heterozygous somatic SNV)."""
-    sub_err = substitution_error(sites, A, D)
+    sub_err = sub_err if sub_err is not None else substitution_error(sites, A, D)
     post = np.full(A.shape, np.nan)
     eps_out, pi_out, bg_out, vaf_out = [], [], [], []
     for k in range(A.shape[1]):
