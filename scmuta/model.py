@@ -44,6 +44,7 @@ class SiteFilters:
     germline_cell_frac: float = 0.6
     editing_bed: str | None = None     # known RNA-editing sites (REDIportal etc.); A>G/T>C flagged if listed
     flag_all_ag: bool = False          # flag every A>G / T>C as possible editing when no list is given
+    editing_cluster_window: int = 0    # >0: flag A>G/T>C candidates with another within this many nt
 
 
 def site_flags(sites: pd.DataFrame, A: np.ndarray, D: np.ndarray, f: SiteFilters | None = None) -> pd.DataFrame:
@@ -61,6 +62,7 @@ def site_flags(sites: pd.DataFrame, A: np.ndarray, D: np.ndarray, f: SiteFilters
     s["subst"] = [subst_type(r, a) for r, a in zip(s.ref, s.alt)]
     n_alt = np.maximum(alt_tot, 1)
     flags = []
+    clustered = editing_clusters(s, f.editing_cluster_window) if f.editing_cluster_window else np.zeros(len(s), bool)
     edit_sites = set()
     if f.editing_bed:
         bed = pd.read_csv(f.editing_bed, sep="\t", header=None, usecols=[0, 1], comment="#")
@@ -94,9 +96,31 @@ def site_flags(sites: pd.DataFrame, A: np.ndarray, D: np.ndarray, f: SiteFilters
                 fl.append("rna_editing_known")
             elif f.flag_all_ag:
                 fl.append("possible_editing")
+        if clustered[k]:
+            fl.append("editing_cluster")
         flags.append(",".join(fl) if fl else "PASS")
     s["filter"] = flags
     return s
+
+
+def editing_clusters(sites: pd.DataFrame, window: int = 50) -> np.ndarray:
+    """A>G / T>C candidates with another A>G / T>C candidate within `window` nt: the clustered pattern of A-to-I
+    RNA editing (hyper-edited Alu and other dsRNA). Somatic SNVs rarely come in tight same-type clusters."""
+    st = np.array([subst_type(r, a) for r, a in zip(sites.ref, sites.alt)])
+    ag = st == "T>C"
+    out = np.zeros(len(sites), bool)
+    for c in pd.unique(sites.chrom):
+        idx = np.flatnonzero((sites.chrom.to_numpy() == c) & ag)
+        if len(idx) < 2:
+            continue
+        pos = sites.pos.to_numpy()[idx]
+        o = np.argsort(pos)
+        p = pos[o]
+        near = np.zeros(len(p), bool)
+        near[1:] |= np.diff(p) <= window
+        near[:-1] |= np.diff(p) <= window
+        out[idx[o[near]]] = True
+    return out
 
 
 def _betabinom_logpmf(a, d, al, be):

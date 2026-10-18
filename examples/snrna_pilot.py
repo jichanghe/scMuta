@@ -118,6 +118,9 @@ def main():
     ap.add_argument("--chroms", default="chr22")
     ap.add_argument("--min-cells-type", type=int, default=30)
     ap.add_argument("--out", default="snrna_pilot")
+    ap.add_argument("--editing-bed", default=None, help="known RNA-editing sites (e.g. REDIportal hg38), chrom pos")
+    ap.add_argument("--min-wt-nuclei", type=int, default=5,
+                    help="a somatic call needs >= this many covered (>=2 molecules) wild-type nuclei of the same donor")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     chroms = a.chroms.split(",")
@@ -231,22 +234,49 @@ def main():
         keep_sites = ~germ[d]
         neg = donor_of != d
         res = run_counts_chunked(A[:, keep_sites], D[:, keep_sites], feats[keep_sites].reset_index(drop=True), cells_all,
-                         negative=neg, filters=SiteFilters(stranded_protocol=True), target_fp=0.001,
+                         negative=neg, filters=SiteFilters(stranded_protocol=True, editing_cluster_window=50, editing_bed=a.editing_bed), target_fp=0.001,
                          min_alt_cells=2, out=os.path.join(a.out, f"scmuta_{d}"))
         st = res["sites"]
         calls = res["calls"].merge(cm[["cell_type"]], left_on="cell", right_index=True)
         calls["donor"] = d
+        # informativeness: a somatic variant must be absent from covered nuclei of the same donor; otherwise a
+        # barely covered germline heterozygous SNP looks identical
+        m = (donor_of == d)
+        Dk, Ak = D[:, keep_sites][m], A[:, keep_sites][m]
+        cov2 = (Dk >= 2)
+        wt = np.asarray(cov2.sum(0)).ravel() - np.asarray(cov2.multiply(Ak > 0).sum(0)).ravel()
+        st["donor_wt_nuclei"] = wt
+        st["somatic_supported"] = st["variant"] & (st["donor_wt_nuclei"] >= a.min_wt_nuclei)
+        ok_sites = set(zip(st.chrom[st.somatic_supported], st.pos[st.somatic_supported]))
+        calls["somatic_supported"] = [(c, p) in ok_sites for c, p in zip(calls.chrom, calls.pos)]
         results.append(calls)
+        # burden per genotypable cell-site pair (>= 2 molecules at PASS sites), by cell type: coverage-normalised
+        pass_idx = np.flatnonzero((st["filter"] == "PASS").to_numpy())
+        Dp = D[:, keep_sites][:, pass_idx]
+        gen_pairs = np.asarray((Dp[m] >= 2).sum(1)).ravel()
+        tm = types_of[m]
+        bur = []
+        for t in sorted(set(tm)):
+            n_pairs = int(gen_pairs[tm == t].sum())
+            n_calls = int(((calls.cell_type == t) & calls.somatic_supported).sum())
+            bur.append({"cell_type": t, "nuclei": int((tm == t).sum()), "genotypable_pairs": n_pairs,
+                        "supported_calls": n_calls, "calls_per_1e5_pairs": round(1e5 * n_calls / max(n_pairs, 1), 2),
+                        "all_calls": int((calls.cell_type == t).sum())})
+        bur = pd.DataFrame(bur)
+        bur.to_csv(os.path.join(a.out, f"burden_{d}.tsv"), sep="\t", index=False)
         summary[d] = {"germline_like": int(germ[d].sum()), **{k: res["summary"][k] for k in
                       ("pass_filters", "variants", "cell_calls", "threshold")},
+                      "somatic_supported_variants": int(st["somatic_supported"].sum()),
                       "removed_by_negative_controls": int((st["filter"] == "in_negative_controls").sum()),
                       "filters": res["summary"]["filters"]}
         print(f"\n=== donor {d} vs other donors as negatives")
         print(json.dumps(summary[d], indent=1, default=float))
         if res["summary"]["variants"]:
-            v = st[st.variant][["chrom", "pos", "ref", "alt", "vaf_pooled", "cells_called", "negative_cells_called"]]
-            print(v.assign(pos=v.pos + 1).head(30).to_string(index=False))
-            print(calls.groupby("cell_type").size().rename("calls").to_string())
+            v = st[st.variant][["chrom", "pos", "ref", "alt", "subst", "vaf_pooled", "cells_called", "donor_wt_nuclei",
+                                "somatic_supported", "negative_cells_called"]]
+            print(v.assign(pos=v.pos + 1).head(40).to_string(index=False))
+        print("burden by cell type (coverage-normalised):")
+        print(bur.to_string(index=False))
     pd.concat(results).to_csv(os.path.join(a.out, "somatic_calls.tsv"), sep="\t", index=False)
     json.dump(summary, open(os.path.join(a.out, "summary.json"), "w"), indent=1, default=float)
 
