@@ -70,3 +70,15 @@ def test_not_genotypable_is_not_wild_type():
     sites = pd.DataFrame({"subst": [subst_type("C", "A")]})
     post, _ = call_cells(sites, A, D, min_depth=2)
     assert np.isnan(post[0, 0]) and np.isnan(post[2, 0]) and post[1, 0] > 0.5
+
+
+def test_vectorised_em_matches_per_site_loop():
+    from scmuta.model import _call_cells_loop, call_cells, site_flags
+    sim = simulate(seed=3)
+    s = site_flags(sim["sites"], sim["A"], sim["D"])
+    p1, s1 = _call_cells_loop(s, sim["A"], sim["D"])
+    p2, s2 = call_cells(s, sim["A"], sim["D"])
+    assert (np.isnan(p1) == np.isnan(p2)).all()
+    f = np.isfinite(p1)
+    assert np.abs(p1[f] - p2[f]).max() < 1e-9
+    assert np.allclose(s1.frac_mutant, s2.frac_mutant) and np.allclose(s1.mutant_vaf, s2.mutant_vaf)

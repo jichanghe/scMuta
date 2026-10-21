@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+- Per-cell genotype EM vectorised over all covered cell-site pairs (identical results, ~5x faster on large
+  droplet data; per-site reference implementation kept for tests).
+
 ## 0.1.0 (2026-10-21)
 - Position filters (read end, soft clip) compare alt reads with reference reads at the same site; junction
   window 3 nt; homopolymer extension requires a run >= 4.

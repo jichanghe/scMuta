@@ -239,6 +239,68 @@ def call_cells(sites: pd.DataFrame, A: np.ndarray, D: np.ndarray, mut_mean: floa
     (shrunk toward mut_mean with vaf_prior pseudo-reads), so a cell with few reads is judged against what this
     mutation looks like (e.g. ~0.97 for a homozygous edit, ~0.5 for a heterozygous somatic SNV)."""
     sub_err = sub_err if sub_err is not None else substitution_error(sites, A, D)
+    A = np.asarray(A)
+    D = np.asarray(D)
+    n_sites = A.shape[1]
+    post = np.full(A.shape, np.nan)
+    e0 = np.array([sub_err.get(x, 1e-3) for x in sites.subst], float)
+    # all sites at once over the covered cell-site pairs only (EM per site, vectorised; a site stops updating
+    # once it has converged, exactly as a per-site loop would)
+    ci, si = np.nonzero(D >= min_depth)
+    a = A[ci, si].astype(float)
+    d = D[ci, si].astype(float)
+    n = np.bincount(si, minlength=n_sites).astype(float)
+    pi = np.full(n_sites, 0.1)
+    eps = e0.copy()
+    mu = np.full(n_sites, float(mut_mean))
+    active = n > 0
+    r_keep = np.zeros(len(a))
+    # the binomial coefficient is the same in both components and every iteration: it cancels in the
+    # posterior, so only the parts that depend on the parameters are computed (on still-active sites)
+    b = d - a
+    for _ in range(n_iter):
+        if not active.any():
+            break
+        idx = np.flatnonzero(active[si])
+        sj, aj, bj, dj = si[idx], a[idx], b[idx], d[idx]
+        al, be = mu * mut_conc, (1 - mu) * mut_conc
+        l1 = np.log(pi[sj]) + betaln(aj + al[sj], bj + be[sj]) - betaln(al, be)[sj]
+        e = eps[sj]
+        l0 = np.log1p(-pi[sj]) + aj * np.log(e) + bj * np.log1p(-e)
+        r = 1.0 / (1.0 + np.exp(np.clip(l0 - l1, -700, 700)))
+        r_keep[idx] = r
+        sr = np.bincount(sj, weights=r, minlength=n_sites)
+        pi_new = np.clip((sr + 0.1) / (n + 1.0), 1e-4, 0.999)
+        w = 1 - r
+        eps_new = (np.bincount(sj, weights=w * aj, minlength=n_sites) + prior_strength * e0) / \
+                  (np.bincount(sj, weights=w * dj, minlength=n_sites) + prior_strength)
+        eps_new = np.clip(eps_new, 1e-6, 0.2)
+        if learn_vaf:
+            mu_new = np.clip((np.bincount(sj, weights=r * aj, minlength=n_sites) + vaf_prior * mut_mean) /
+                             (np.bincount(sj, weights=r * dj, minlength=n_sites) + vaf_prior), 0.4, 0.98)
+            mu = np.where(active, mu_new, mu)
+        conv = (np.abs(pi_new - pi) < 1e-6) & (np.abs(eps_new - eps) < 1e-9)
+        pi = np.where(active, pi_new, pi)
+        eps = np.where(active, eps_new, eps)
+        active = active & ~conv
+    post[ci, si] = r_keep
+    covered = n > 0
+    eps_out = np.where(covered, eps, e0).tolist()
+    pi_out = np.where(covered, pi, 0.0).tolist()
+    vaf_out = np.where(covered, mu, mut_mean).tolist()
+    bg_out = e0.tolist()
+    s = sites.copy()
+    s["error_rate"] = eps_out
+    s["background_error"] = bg_out
+    s["frac_mutant"] = pi_out
+    s["mutant_vaf"] = vaf_out
+    return post, s
+
+
+def _call_cells_loop(sites, A, D, mut_mean=0.5, mut_conc=4.0, prior_strength=2000.0, n_iter=50,
+                     min_depth=2, learn_vaf=True, vaf_prior=20.0, sub_err=None):
+    """Reference implementation (one site at a time), kept for tests."""
+    sub_err = sub_err if sub_err is not None else substitution_error(sites, A, D)
     post = np.full(A.shape, np.nan)
     eps_out, pi_out, bg_out, vaf_out = [], [], [], []
     for k in range(A.shape[1]):
