@@ -36,7 +36,10 @@ class SiteFilters:
     stranded_protocol: bool = False    # 10x 3'/5': reads come from one strand; strand bias is meaningless
     max_strand_bias_p: float = 1e-3    # Fisher p for alt vs ref strand distribution
     min_strand_shift: float = 0.25     # ... and the forward fraction of alt reads must differ from ref by this
-    max_frac_near_end: float = 0.6     # alt reads within 10 nt of a read end
+    max_frac_near_end: float = 0.6     # alt reads within 10 nt of a read end (used when ref-read features are absent)
+    position_bias_p: float = 1e-3      # alt reads near read ends / clips enriched over ref reads (one-sided Fisher)
+    min_position_shift: float = 0.25   # ... and by at least this fraction
+    min_homopolymer: int = 4           # alt base extends a homopolymer run to >= this length -> repeat_extension
     max_frac_near_junction: float = 0.5  # alt reads within 10 nt of a splice junction in the read
     max_frac_near_clip: float = 0.5
     min_mean_baseq: float = 25.0
@@ -45,6 +48,41 @@ class SiteFilters:
     editing_bed: str | None = None     # known RNA-editing sites (REDIportal etc.); A>G/T>C flagged if listed
     flag_all_ag: bool = False          # flag every A>G / T>C as possible editing when no list is given
     editing_cluster_window: int = 0    # >0: flag A>G/T>C candidates with another within this many nt
+
+
+def homopolymer_run(context: str, alt: str) -> int:
+    """Length of the run of `alt` bases the alt allele would create, from a context string 'LLLL[R]RRRR'."""
+    try:
+        left, rest = context.split("[", 1)
+        right = rest.split("]", 1)[1]
+    except (ValueError, IndexError, AttributeError):
+        return 1
+    n = 1
+    for c in reversed(left):
+        if c != alt:
+            break
+        n += 1
+    for c in right:
+        if c != alt:
+            break
+        n += 1
+    return n
+
+
+def _enriched(k_alt, n_alt, k_ref, n_ref, f) -> bool:
+    """Alt reads carry a position feature (near a read end / clip) more often than ref reads at the site."""
+    k_alt, n_alt, k_ref, n_ref = (int(round(x)) for x in (k_alt, n_alt, k_ref, n_ref))
+    k_alt, k_ref = min(max(k_alt, 0), n_alt), min(max(k_ref, 0), n_ref)
+    if n_alt < 3:
+        return False
+    fa = k_alt / n_alt
+    if n_ref < 5:                       # (nearly) homozygous: compare with the typical fraction instead
+        return fa > f.max_frac_near_end and n_alt >= 6
+    fr = k_ref / n_ref
+    if fa - fr <= f.min_position_shift:
+        return False
+    p = stats.fisher_exact([[k_alt, n_alt - k_alt], [k_ref, n_ref - k_ref]], alternative="greater")[1]
+    return p < f.position_bias_p
 
 
 def site_flags(sites: pd.DataFrame, A: np.ndarray, D: np.ndarray, f: SiteFilters | None = None) -> pd.DataFrame:
@@ -67,6 +105,8 @@ def site_flags(sites: pd.DataFrame, A: np.ndarray, D: np.ndarray, f: SiteFilters
     if f.editing_bed:
         bed = pd.read_csv(f.editing_bed, sep="\t", header=None, usecols=[0, 1], comment="#")
         edit_sites = set(zip(bed[0].astype(str), bed[1].astype(int)))
+    has_ref_pos = {"ref_near_end", "ref_near_clip"} <= set(s.columns)
+    has_ctx = "context" in s.columns
     for k in range(len(s)):
         fl = []
         if not f.stranded_protocol and alt_tot[k] >= 4:
@@ -79,15 +119,32 @@ def site_flags(sites: pd.DataFrame, A: np.ndarray, D: np.ndarray, f: SiteFilters
             one_sided = min(s.alt_fwd[k], s.alt_rev[k]) == 0 and alt_tot[k] >= 6
             if (p < f.max_strand_bias_p and abs(f_alt - f_ref) > f.min_strand_shift) or one_sided:
                 fl.append("strand_bias")
-        if s.alt_near_end[k] / n_alt[k] > f.max_frac_near_end:
-            fl.append("read_end")
-        if s.alt_near_junction[k] / n_alt[k] > f.max_frac_near_junction:
+        if has_ref_pos:
+            # compare with the reference reads at the same site: a real variant 8 nt from an exon end or covered by
+            # short reads has its alt reads near read ends exactly as often as its ref reads
+            # read features are summed over the cells that were counted, which can be more than the cells in A
+            # (e.g. a benchmark's held-out half), so take the totals from the same feature table
+            n_ref = s.ref_fwd[k] + s.ref_rev[k]
+            n_alt_f = s.alt_fwd[k] + s.alt_rev[k]
+            if _enriched(s.alt_near_end[k], n_alt_f, s.ref_near_end[k], n_ref, f):
+                fl.append("read_end")
+            if _enriched(s.alt_near_clip[k], n_alt_f, s.ref_near_clip[k], n_ref, f):
+                fl.append("soft_clip")
+        else:
+            if s.alt_near_end[k] / n_alt[k] > f.max_frac_near_end:
+                fl.append("read_end")
+            if s.alt_near_clip[k] / n_alt[k] > f.max_frac_near_clip:
+                fl.append("soft_clip")
+        # mis-aligned junction overhangs put mismatches at the bases next to a junction in the read
+        n_alt_j = (s.alt_fwd[k] + s.alt_rev[k]) if has_ref_pos else n_alt[k]
+        if s.alt_near_junction[k] / max(n_alt_j, 1) > f.max_frac_near_junction:
             fl.append("splice_junction")
-        if s.alt_near_clip[k] / n_alt[k] > f.max_frac_near_clip:
-            fl.append("soft_clip")
         if alt_tot[k] and s.alt_baseq_sum[k] / alt_tot[k] < f.min_mean_baseq:
             fl.append("low_baseq")
-        if "repeat_extension" in s.columns and s.repeat_extension[k]:
+        if has_ctx:
+            if homopolymer_run(s.context[k], s.alt[k]) >= f.min_homopolymer:
+                fl.append("repeat_extension")
+        elif "repeat_extension" in s.columns and s.repeat_extension[k]:
             fl.append("repeat_extension")
         if s.vaf_pooled[k] > f.germline_vaf and cov[k] > 0 and with_alt[k] / cov[k] > f.germline_cell_frac:
             fl.append("germline_like")

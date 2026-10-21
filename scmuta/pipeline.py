@@ -12,6 +12,43 @@ from .model import (SiteFilters, calibrate_threshold, call_cells, callable_poste
 from .util import log
 
 
+GRID = np.array([0.5, 0.7, 0.8, 0.9, 0.95, 0.99, 0.999])
+
+
+def loo_negative_calls(pc, A, D, neg_idx, usable, bg, neg_p=1e-3, grid=GRID, case=None, min_alt_cells=1):
+    """Leave-one-out calibration on negative-control cells.
+
+    For each negative cell, a site counts towards its false-call rate only if the OTHER negative cells do not
+    already carry the allele (binomial excess over the background error with >= 2 alt reads). This removes the
+    controls' own germline variants and shared artefacts from the error estimate (the final site screen removes
+    them from the calls) without using the cell's own reads, so the estimate is not circular.
+    A control cell's call counts only at sites that would be reported at that threshold (called in >=
+    min_alt_cells case cells), so the estimate is the false-call rate of the reported calls; single-cell noise at
+    sites that no case cell shares is never reported and is not counted.
+    Returns (calls per threshold, covered pairs)."""
+    from scipy import stats
+    an = np.asarray(A[neg_idx], float)
+    dn = np.asarray(D[neg_idx], float)
+    a_oth = an.sum(0)[None, :] - an
+    d_oth = dn.sum(0)[None, :] - dn
+    with np.errstate(invalid="ignore"):
+        p = stats.binom.sf(a_oth - 1, d_oth, np.broadcast_to(bg, a_oth.shape))
+    bad = (p < neg_p) & (a_oth >= 2)
+    sub = np.array(pc[neg_idx], float)
+    sub[:, ~usable] = np.nan
+    sub[bad] = np.nan
+    cov = np.isfinite(sub)
+    sub0 = np.nan_to_num(sub, nan=0)
+    if case is None or min_alt_cells <= 1:
+        return np.array([(sub0 >= t).sum() for t in grid], float), float(cov.sum())
+    pcc = np.nan_to_num(np.asarray(pc[np.asarray(case, bool)], float), nan=0)
+    out = []
+    for t in grid:
+        reported = (pcc >= t).sum(0) >= min_alt_cells
+        out.append((sub0[:, reported] >= t).sum())
+    return np.array(out, float), float(cov.sum())
+
+
 def run_counts(A, D, sites, cells, negative=None, filters: SiteFilters | None = None, target_fp=0.001,
                threshold=None, min_alt_cells=2, neg_p=1e-3, seed=0, out=None, min_cell_alt=2, min_threshold=0.9):
     """A, D: cells x sites alt and depth counts. negative: boolean mask of negative-control cells (or None).
@@ -26,9 +63,9 @@ def run_counts(A, D, sites, cells, negative=None, filters: SiteFilters | None = 
     if negative is not None and negative.any():
         negative = np.asarray(negative, bool)
         case = ~negative
-        # cross-fitting on the negative controls: split them into two folds; each fold's false-call rate is
-        # measured at sites screened with the OTHER fold only, so the reported rate is not estimated on the
-        # cells that removed the artefact sites. The final site screen uses all negative controls (most power).
+        # leave-one-out on the negative controls: each control cell's false-call rate is measured at sites screened
+        # with the OTHER control cells only (see loo_negative_calls), so the rate is not estimated on the reads
+        # that removed the site. The final site screen uses all negative controls (most power).
         from scipy import stats
         rng = np.random.default_rng(seed)
         neg_idx = np.flatnonzero(negative)
@@ -43,16 +80,10 @@ def run_counts(A, D, sites, cells, negative=None, filters: SiteFilters | None = 
 
         bad_all, a_n, d_n, p_neg = screen(neg_idx)
         s["negative_alt_reads"], s["negative_depth"], s["negative_p"] = a_n, d_n, p_neg
-        tabs = []
-        for k in (0, 1):
-            other_bad = screen(folds[1 - k])[0]
-            held = np.zeros(len(cells), bool)
-            held[folds[k]] = True
-            tabs.append(calibrate_threshold(post_call, held, usable & ~other_bad, target_fp)[1])
-        calib = tabs[0].copy()
-        calib["negative_calls"] = tabs[0].negative_calls + tabs[1].negative_calls
-        calib["negative_pairs"] = tabs[0].negative_pairs + tabs[1].negative_pairs
-        calib["negative_fp_rate"] = calib.negative_calls / calib.negative_pairs.clip(lower=1)
+        nc, npairs = loo_negative_calls(post_call, A, D, neg_idx, usable, bg, neg_p, case=case,
+                                        min_alt_cells=min_alt_cells)
+        calib = pd.DataFrame({"threshold": GRID, "negative_calls": nc.astype(int), "negative_pairs": int(npairs),
+                              "negative_fp_rate": nc / max(npairs, 1)})
         ok = calib[calib.negative_fp_rate <= target_fp]
         thr_calibrated = float(ok.threshold.min()) if len(ok) else float(calib.threshold.max())
         # the calibrated threshold can only raise the bar: when negatives give no calls at all, the lowest grid
@@ -146,14 +177,10 @@ def run_counts_chunked(A, D, sites, cells, negative, filters: SiteFilters | None
 
         bad_all, a_n, d_n, p_neg = screen(neg_idx)
         s["negative_alt_reads"], s["negative_depth"], s["negative_p"] = a_n, d_n, p_neg
-        for k in (0, 1):
-            other_bad = screen(folds[1 - k])[0]
-            u = usable & ~other_bad
-            sub = pc[held[k]][:, u]
-            cov = np.isfinite(sub)
-            neg_pairs[k] += cov.sum()
-            sub0 = np.nan_to_num(sub, nan=0)
-            neg_calls[k] += [(sub0 >= t).sum() for t in grid]
+        nc, npairs = loo_negative_calls(pc, a, d, neg_idx, usable, bg, neg_p, grid, case=case,
+                                        min_alt_cells=min_alt_cells)
+        neg_calls[0] += nc
+        neg_pairs[0] += npairs
         s.loc[bad_all & usable, "filter"] = "in_negative_controls"
         # keep posteriors sparsely (only covered cell-site pairs)
         rows, cols = np.nonzero(np.isfinite(pc))
@@ -200,4 +227,8 @@ def run_counts_chunked(A, D, sites, cells, negative, filters: SiteFilters | None
         calib.to_csv(os.path.join(out, "calibration.tsv"), sep="\t", index=False)
         with open(os.path.join(out, "summary.json"), "w") as fh:
             json.dump(summary, fh, indent=2, default=float)
-    return {"sites": st, "calls": calls, "calibration": calib, "summary": summary}
+    # posteriors of covered cell-site pairs (sparse; 0 = not covered), for genotype states downstream
+    post_call_sp = sparse.hstack([b[2] for b in blocks]).tocsc() if blocks else None
+    post_sp = sparse.hstack([b[3] for b in blocks]).tocsc() if blocks else None
+    return {"sites": st, "calls": calls, "calibration": calib, "summary": summary,
+            "posterior_call_sparse": post_call_sp, "posterior_sparse": post_sp}

@@ -20,7 +20,7 @@ import pandas as pd
 from . import __version__
 from .model import SiteFilters
 from .pileup import ReadFilter, count, discover, plate_bams
-from .pipeline import run_counts
+from .pipeline import run_counts, run_counts_chunked
 
 
 def _regions(path):
@@ -31,6 +31,13 @@ def _regions(path):
 def _lines(path):
     with open(path) as fh:
         return [x.strip().split("\t")[0].split(",")[0] for x in fh if x.strip() and not x.startswith("#")]
+
+
+def _negative_mask(path, cells):
+    if not path:
+        return None
+    negset = set(_lines(path))
+    return np.array([c in negset for c in cells])
 
 
 def main(argv=None):
@@ -62,6 +69,9 @@ def main(argv=None):
     c.add_argument("--editing-bed", help="known RNA-editing sites (chrom, pos)")
     c.add_argument("--flag-all-ag", action="store_true", help="flag every A>G/T>C as possible editing")
     c.add_argument("--truth", help="optional cell,label CSV (label 1 = carries the variant) for known sites")
+    c.add_argument("--block-sites", type=int, default=20000,
+                   help="count this many candidate sites at a time; above one block the memory-light sparse "
+                        "pipeline is used (same procedure, for large droplet data)")
     c.add_argument("--out", required=True)
     a = ap.parse_args(argv)
 
@@ -80,20 +90,42 @@ def main(argv=None):
     if sites.empty:
         raise SystemExit("no candidate sites found")
     dedup = a.dedup or ("umi" if a.bam else "none")
-    A, D, s, cells = count(bams, a.fasta, sites, rf, tag, keep, umi_tag=a.umi_tag, dedup=dedup)
-    neg = None
-    if a.negative:
-        negset = set(_lines(a.negative))
-        neg = np.array([c in negset for c in cells])
     filters = SiteFilters(stranded_protocol=a.stranded, editing_bed=a.editing_bed, flag_all_ag=a.flag_all_ag)
-    res = run_counts(A, D, s, cells, negative=neg, filters=filters, target_fp=a.target_fp, threshold=a.threshold,
-                     min_alt_cells=1 if a.sites else a.min_alt_cells, out=a.out,
-                     min_cell_alt=a.min_cell_alt)
+    min_alt_cells = 1 if a.sites else a.min_alt_cells
+    sites = sites.sort_values(["chrom", "pos", "alt"]).reset_index(drop=True)
+    if len(sites) <= a.block_sites:
+        A, D, s, cells = count(bams, a.fasta, sites, rf, tag, keep, umi_tag=a.umi_tag, dedup=dedup)
+        neg = _negative_mask(a.negative, cells)
+        res = run_counts(A, D, s, cells, negative=neg, filters=filters, target_fp=a.target_fp,
+                         threshold=a.threshold, min_alt_cells=min_alt_cells, out=a.out, min_cell_alt=a.min_cell_alt)
+    else:
+        # large data: count in blocks of sites into sparse matrices over a fixed cell list, then the chunked pipeline
+        from scipy import sparse
+        parts = []
+        for b0 in range(0, len(sites), a.block_sites):
+            blk = sites.iloc[b0:b0 + a.block_sites].reset_index(drop=True)
+            Ab, Db, sb, cb_ = count(bams, a.fasta, blk, rf, tag, keep, umi_tag=a.umi_tag, dedup=dedup)
+            parts.append((sparse.csr_matrix(Ab), sparse.csr_matrix(Db), sb, cb_))
+        cells = sorted(set().union(*[set(p[3]) for p in parts]))
+        ci = {c: k for k, c in enumerate(cells)}
+        As, Ds = [], []
+        for Ab, Db, _, cb_ in parts:
+            rows = np.array([ci[c] for c in cb_], int)
+            P = sparse.csr_matrix((np.ones(len(rows)), (rows, np.arange(len(rows)))), shape=(len(cells), len(rows)))
+            As.append(P @ Ab)
+            Ds.append(P @ Db)
+        A, D = sparse.hstack(As).tocsc(), sparse.hstack(Ds).tocsc()
+        s = pd.concat([p[2] for p in parts], ignore_index=True)
+        neg = _negative_mask(a.negative, cells)
+        if neg is None or not neg.any():
+            raise SystemExit("large runs need --negative control cells (the chunked pipeline is calibrated on them)")
+        res = run_counts_chunked(A, D, s, cells, neg, filters=filters, target_fp=a.target_fp,
+                                 min_alt_cells=min_alt_cells, out=a.out, min_cell_alt=a.min_cell_alt)
     if a.truth:
         tr = pd.read_csv(a.truth).set_index(pd.read_csv(a.truth).columns[0]).iloc[:, 0]
         called = set(res["calls"].cell)
         lab = tr.reindex(cells)
-        cov = (D.sum(1) > 0)
+        cov = np.asarray(D.sum(1)).ravel() > 0
         df = pd.DataFrame({"cell": cells, "label": lab.to_numpy(), "called": [c in called for c in cells], "covered": cov})
         df.to_csv(os.path.join(a.out, "truth_check.tsv"), sep="\t", index=False)
         d = df[df.covered & df.label.notna()]

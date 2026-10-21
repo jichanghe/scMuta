@@ -125,8 +125,8 @@ def discover(bams, fasta: str, regions, rf: ReadFilter | None = None, tag: str |
 
 
 def count(bams, fasta: str, sites: pd.DataFrame, rf: ReadFilter | None = None, tag: str | None = None,
-          keep_cells=None, end_window: int = 10, junction_window: int = 10, umi_tag: str | None = None,
-          dedup: str = "none"):
+          keep_cells=None, end_window: int = 10, junction_window: int = 3, umi_tag: str | None = None,
+          dedup: str = "none", fast: bool = True):
     """Pass 2: per-cell ref/alt counts at candidate sites, plus per-site artefact features of alt reads.
 
     dedup: "none"  - count reads
@@ -134,9 +134,15 @@ def count(bams, fasta: str, sites: pd.DataFrame, rf: ReadFilter | None = None, t
            "start" - count distinct (start, strand) per cell, site and allele; a proxy for molecules in
                      plate data without UMIs (removes PCR duplicates that escaped duplicate marking)
     Returns (cells x sites alt matrix, cells x sites depth matrix (ref+alt), site feature table, cell list).
+    Plate input (one BAM per cell) uses a fast path: base counts per strand come from htslib
+    (count_coverage), and only reads with a mismatch are walked in Python for the artefact features.
+    With dedup="start" the fast path keeps the first read per (start, strand) in each cell (the slow path
+    deduplicates per site and allele; the two differ only when duplicates disagree at a site).
     """
     if dedup == "umi" and not umi_tag:
         raise ValueError("dedup='umi' needs umi_tag (e.g. UB)")
+    if fast and isinstance(bams, dict) and dedup in ("none", "start"):
+        return _count_plate_fast(bams, fasta, sites, rf or ReadFilter(), end_window, junction_window, dedup)
     seen = set()
     rf = rf or ReadFilter()
     sites = sites.reset_index(drop=True)
@@ -145,8 +151,8 @@ def count(bams, fasta: str, sites: pd.DataFrame, rf: ReadFilter | None = None, t
         by_pos[(s.chrom, int(s.pos))].append((i, s.ref, s.alt))
     alt = defaultdict(int)      # (cell, site) -> alt reads
     refc = defaultdict(int)     # (cell, site) -> ref reads
-    feat = np.zeros((len(sites), 8))  # alt_fwd, alt_rev, ref_fwd, ref_rev, alt_near_end, alt_near_junction,
-    #                                   alt_near_clip, alt_baseq_sum
+    feat = np.zeros((len(sites), 11))  # alt_fwd, alt_rev, ref_fwd, ref_rev, alt_near_end, alt_near_junction,
+    #                                    alt_near_clip, alt_baseq_sum, ref_near_end, ref_near_junction, ref_near_clip
     inputs = _cells_from_inputs(bams, tag)
     # group candidate positions into windows to fetch once per window
     pos_df = sites[["chrom", "pos"]].drop_duplicates().sort_values(["chrom", "pos"])
@@ -166,23 +172,32 @@ def count(bams, fasta: str, sites: pd.DataFrame, rf: ReadFilter | None = None, t
         for region in windows:
             sp = sorted_pos[region[0]]
             for cb, r in _iter_reads(path, region, rf, t, keep_cells):
-                # candidate sites inside this read's aligned blocks (most reads in a window cover none)
-                here = []
-                for b0, b1 in r.get_blocks():
-                    i0, i1 = np.searchsorted(sp, b0), np.searchsorted(sp, b1)
-                    if i1 > i0:
-                        here.extend(sp[i0:i1].tolist())
-                if not here:
+                # candidate sites inside this read's aligned blocks (most reads in a window cover none): walk the
+                # CIGAR to get their read positions directly; sites outside this window are counted in their own
+                # window (a spliced read can reach the next one), so they are skipped here
+                pairs = []
+                rpos, qpos = r.reference_start, 0
+                for op, ln in r.cigartuples or ():
+                    if op in (0, 7, 8):
+                        lo, hi = max(rpos, region[1]), min(rpos + ln, region[2])
+                        if hi > lo:
+                            j0, j1 = np.searchsorted(sp, lo), np.searchsorted(sp, hi)
+                            for x in sp[j0:j1]:
+                                pairs.append((qpos + int(x) - rpos, int(x)))
+                        rpos += ln
+                        qpos += ln
+                    elif op in (1, 4):
+                        qpos += ln
+                    elif op in (2, 3):
+                        rpos += ln
+                if not pairs:
                     continue
-                here = set(here)
                 cid = cb if t else cell
                 q = r.query_qualities
                 seq = r.query_sequence
                 edges, clips = _junction_and_clip_distance(r)
                 qlen = r.query_length
-                for qp, rp in r.get_aligned_pairs(matches_only=True):
-                    if rp not in here:
-                        continue
+                for qp, rp in pairs:
                     hits = by_pos.get((region[0], rp))
                     if not hits or q[qp] < rf.min_baseq:
                         continue
@@ -208,6 +223,9 @@ def count(bams, fasta: str, sites: pd.DataFrame, rf: ReadFilter | None = None, t
                         elif b == rb:
                             refc[(cid, i)] += 1
                             feat[i, 3 if r.is_reverse else 2] += 1
+                            feat[i, 8] += near_end
+                            feat[i, 9] += near_j
+                            feat[i, 10] += near_c
     cells = sorted({k[0] for k in list(alt) + list(refc)})
     ci = {c: j for j, c in enumerate(cells)}
     A = np.zeros((len(cells), len(sites)), np.int32)
@@ -225,11 +243,142 @@ def count(bams, fasta: str, sites: pd.DataFrame, rf: ReadFilter | None = None, t
         ctx.append(f"{left}[{ref.fetch(c_, int(p_), int(p_) + 1).upper()}]{right}")
         # alt base extends an adjacent homopolymer run (e.g. TT[C]TT > T): a known sequencing/library artefact
         rep.append(int(left[-2:] == a_ * 2 or right[:2] == a_ * 2))
-    f = pd.DataFrame(feat, columns=["alt_fwd", "alt_rev", "ref_fwd", "ref_rev", "alt_near_end",
-                                    "alt_near_junction", "alt_near_clip", "alt_baseq_sum"])
+    f = pd.DataFrame(feat, columns=FEATURES)
     f["context"] = ctx
     f["repeat_extension"] = rep
     log(f"count: {len(cells)} cells x {len(sites)} sites")
+    return A, D, pd.concat([sites, f], axis=1), cells
+
+
+FEATURES = ["alt_fwd", "alt_rev", "ref_fwd", "ref_rev", "alt_near_end", "alt_near_junction", "alt_near_clip",
+            "alt_baseq_sum", "ref_near_end", "ref_near_junction", "ref_near_clip"]
+
+
+def _windows(sites, gap=5000, max_span=1_000_000):
+    pos_df = sites[["chrom", "pos"]].drop_duplicates().sort_values(["chrom", "pos"])
+    out = []
+    for chrom, g in pos_df.groupby("chrom", sort=False):
+        p = g.pos.to_numpy()
+        s0 = prev = p[0]
+        for x in p[1:]:
+            if x - prev > gap or x - s0 > max_span:
+                out.append((chrom, int(s0), int(prev) + 1))
+                s0 = x
+            prev = x
+        out.append((chrom, int(s0), int(prev) + 1))
+    return out
+
+
+def _count_plate_fast(bams, fasta, sites, rf, end_window, junction_window, dedup):
+    sites = sites.reset_index(drop=True)
+    n = len(sites)
+    chrom_a = sites.chrom.to_numpy()
+    pos_a = sites.pos.to_numpy().astype(np.int64)
+    ref_i = np.array([B2I.get(str(b).upper(), -1) for b in sites.ref])
+    alt_i = np.array([B2I.get(str(b).upper(), -1) for b in sites.alt])
+    windows = _windows(sites)
+    win_sites = []
+    for chrom, ws, we in windows:
+        idx = np.flatnonzero((chrom_a == chrom) & (pos_a >= ws) & (pos_a < we))
+        win_sites.append(idx)
+    cell_list = list(bams)
+    A = np.zeros((len(cell_list), n), np.int32)
+    R = np.zeros((len(cell_list), n), np.int32)
+    feat = np.zeros((n, 11))
+    for ci, cell in enumerate(cell_list):
+        with pysam.AlignmentFile(bams[cell]) as bam:
+            for (chrom, ws, we), idx in zip(windows, win_sites):
+                if len(idx) == 0:
+                    continue
+                off = pos_a[idx] - ws
+                ok = (ref_i[idx] >= 0) & (alt_i[idx] >= 0) & (ref_i[idx] != alt_i[idx])
+                for rev in (False, True):
+                    seen = set()
+
+                    def keep(r, rev=rev, seen=seen):
+                        if r.is_reverse != rev or not rf.read_ok(r):
+                            return False
+                        if dedup == "start":
+                            k = r.reference_start
+                            if k in seen:
+                                return False
+                            seen.add(k)
+                        return True
+                    cov = np.asarray(bam.count_coverage(chrom, ws, we, quality_threshold=rf.min_baseq,
+                                                      read_callback=keep), dtype=np.int64)
+                    a = np.where(ok, cov[np.clip(alt_i[idx], 0, 3), off], 0).astype(np.int32)
+                    r_ = np.where(ok, cov[np.clip(ref_i[idx], 0, 3), off], 0).astype(np.int32)
+                    A[ci, idx] += a
+                    R[ci, idx] += r_
+                    feat[idx, 1 if rev else 0] += a
+                    feat[idx, 3 if rev else 2] += r_
+                # read-level features of alt AND ref bases (alt reads near read ends / junctions are only suspicious
+                # when the reference reads at the same site are not): walk the CIGAR, not every aligned pair
+                sp = pos_a[idx]
+                order = np.argsort(sp)
+                sp_sorted = sp[order]
+                idx_sorted = idx[order]
+                seen = set()
+                for r in bam.fetch(chrom, ws, we):
+                    if not rf.read_ok(r):
+                        continue
+                    if dedup == "start":
+                        k = (r.reference_start, r.is_reverse)
+                        if k in seen:
+                            continue
+                        seen.add(k)
+                    hits = []
+                    rpos, qpos = r.reference_start, 0
+                    for op, ln in r.cigartuples or ():
+                        if op in (0, 7, 8):
+                            j0, j1 = np.searchsorted(sp_sorted, rpos), np.searchsorted(sp_sorted, rpos + ln)
+                            for j in range(j0, j1):
+                                hits.append((int(sp_sorted[j]), qpos + int(sp_sorted[j]) - rpos, int(idx_sorted[j])))
+                            rpos += ln
+                            qpos += ln
+                        elif op in (1, 4):
+                            qpos += ln
+                        elif op in (2, 3):
+                            rpos += ln
+                    if not hits:
+                        continue
+                    q = r.query_qualities
+                    seq = r.query_sequence
+                    qlen = r.query_length
+                    edges, clips = _junction_and_clip_distance(r)
+                    for rp, qp, i in hits:
+                        if q[qp] < rf.min_baseq:
+                            continue
+                        b = B2I.get(seq[qp], -1)
+                        if b < 0:
+                            continue
+                        if b == alt_i[i]:
+                            o = 4
+                        elif b == ref_i[i]:
+                            o = 8
+                        else:
+                            continue
+                        feat[i, o] += min(qp, qlen - 1 - qp) < end_window
+                        feat[i, o + 1] += any(abs(rp - e) < junction_window for e in edges)
+                        feat[i, o + 2] += any(abs(rp - e) < end_window for e in clips)
+                        if o == 4:
+                            feat[i, 7] += q[qp]
+    D = A + R
+    keep_rows = np.flatnonzero(D.sum(1) > 0)
+    cells = sorted(cell_list[k] for k in keep_rows)
+    rows = [cell_list.index(c) for c in cells]
+    A, D = A[rows], D[rows]
+    ref = pysam.FastaFile(fasta)
+    ctx, rep = [], []
+    for c_, p_, a_ in zip(sites.chrom, sites.pos, sites.alt):
+        left = ref.fetch(c_, max(0, int(p_) - 4), int(p_)).upper()
+        right = ref.fetch(c_, int(p_) + 1, int(p_) + 5).upper()
+        ctx.append(f"{left}[{ref.fetch(c_, int(p_), int(p_) + 1).upper()}]{right}")
+        rep.append(int(left[-2:] == a_ * 2 or right[:2] == a_ * 2))
+    f = pd.DataFrame(feat, columns=FEATURES)
+    f["context"] = ctx
+    f["repeat_extension"] = rep
+    log(f"count: {len(cells)} cells x {n} sites")
     return A, D, pd.concat([sites, f], axis=1), cells
 
 

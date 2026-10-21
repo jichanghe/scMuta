@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use scMuta, please cite it as below."
+title: "scMuta: calibrated per-cell somatic mutation calling from single-cell RNA sequencing"
+authors:
+  - family-names: Ji
+    given-names: Changhe
+version: 0.1.0
+date-released: 2026-10-21
+license: MIT
+repository-code: "https://github.com/jichanghe/scMuta"
+keywords: [single-cell, somatic mutation, variant calling, scRNA-seq, calibration]

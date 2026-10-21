@@ -4,13 +4,28 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scmuta"
-version = "0.1.0.dev0"
-description = "Calibrated per-cell SNV calling from single-cell sequencing (negative-control calibration, artefact flags)"
+version = "0.1.0"
+description = "Calibrated per-cell SNV calling from single-cell RNA-seq: per-cell genotypes with a false-call rate measured on control cells"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [{name = "Changhe Ji"}]
 requires-python = ">=3.9"
 dependencies = ["numpy>=1.22", "scipy>=1.8", "pandas>=1.5", "pysam>=0.21"]
+keywords = ["single-cell", "somatic mutation", "variant calling", "scRNA-seq", "snRNA-seq", "calibration"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/jichanghe/scMuta"
+Issues = "https://github.com/jichanghe/scMuta/issues"
 
 [project.scripts]
 scmuta = "scmuta.cli:main"

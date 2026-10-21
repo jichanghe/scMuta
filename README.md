@@ -1,70 +1,139 @@
-# scMuta (working name)
+# scMuta
 
-**Per-cell SNV calling from single-cell sequencing that tells you how many calls are false.**
-Status: **0.1.0.dev0, a prototype.** Tested on simulations and a small BAM fixture only; not yet on real data.
+**Per-cell somatic SNV calls from single-cell RNA-seq, with a false-call rate you can trust.**
 
-Single-cell variant callers are rarely checked for calibration on real cells: per-cell calls are dominated
-by sequencing errors, RNA editing, alignment artefacts and allelic dropout, and most tools report hard calls
-without a measured false-call rate. scMuta follows the scSplicer approach: combine the best existing idea
-for each step, then measure false calls directly on real cells that cannot carry the variants.
+[![tests](https://github.com/jichanghe/scMuta/actions/workflows/tests.yml/badge.svg)](https://github.com/jichanghe/scMuta/actions/workflows/tests.yml)
 
-## What it does
+Calling mutations in single cells from RNA is dominated by false signals: sequencing and reverse-transcription
+errors, RNA editing, alignment artefacts at read ends and splice junctions, germline SNPs, and allelic dropout.
+Most tools return hard calls without saying how many are wrong. scMuta returns a genotype for every cell at
+every candidate site (**mutant / wild type / uncertain / not genotypable**) and measures its own false-call rate
+on control cells that cannot carry the variants (another donor, another cell line, unedited cells). It works on
+plate data (Smart-seq2, SMART-seq+, TARGET-seq; one BAM per cell) and droplet data (10x scRNA / snRNA; one BAM
+with a cell-barcode tag).
 
-| Step | Idea | Inspired by |
-|---|---|---|
-| Candidates | Pooled pileup over cells; reads filtered by MAPQ, base quality, duplicates, mismatch load | cellsnp-lite, pooled callers |
-| Molecules, not reads | `--dedup umi` (droplet) or `start` (plate) | mtDNA single-molecule critique |
-| Artefact flags | strand bias, read-end position, **splice-junction proximity**, soft-clip, base quality, repeat extension (YY[X]YY > Y), known RNA-editing sites, germline-like sites | SComatic, Wiens et al. 2024, scSplicer |
-| Per-cell genotype | Mixture per site: wild type = Binomial(error), mutant = Beta-Binomial (allelic imbalance / dropout); error shrunk to a robust per-substitution background; EM | SComatic, scMitoMut, SC-BIG |
-| Four states | mutant / wild type (reads favour wild type >= 10:1) / **uncertain** / **not genotypable**; mutant VAF learned per site | gap in current tools |
-| **Negative-control calibration** | Cells that cannot carry the variants (another line, donor, unedited cells) screen out sites with excess alt reads (editing, hotspots, germline) and set the posterior threshold; cross-fitted so the reported false-call rate is measured on cells that did not screen those sites | SCEPTRE-style empirical nulls; scSplicer |
-| Reproducibility | Each cell's reads split in two; calls in one half checked for support in the other | scSplicer split checks |
+Status: **0.1.0**, under active development. Interfaces may change before 1.0.
 
-## Simulation benchmark
+## How it works
 
-`python examples/benchmark_sim.py` (150 case + 100 negative-control cells; 60 somatic sites in 3 clones;
-editing, germline, strand, junction, hotspot and noise sites; depth with many zeros; 30% allelic dropout;
-mean of 5 seeds):
+| Step | What scMuta does |
+|---|---|
+| Candidates | Pooled pileup over cells; reads filtered by MAPQ, base quality, duplicates, mismatch load |
+| Molecules | `--dedup umi` (droplet) or `start` (plate): counts molecules, not PCR copies |
+| Site artefact flags | Alt reads compared with **reference reads at the same site**: strand bias, read-end and soft-clip enrichment (Fisher, one-sided); mismatches within 3 nt of a splice junction; homopolymer extension (run >= 4); base quality; known RNA-editing sites and editing clusters; germline-like sites |
+| Per-cell genotype | Per-site mixture fitted by EM: wild type = Binomial(error), mutant = Beta-Binomial with a mutant allele fraction learned per site; error shrunk to a per-substitution background |
+| Four states | mutant; wild type (the cell's reads favour wild type by >= 10:1); uncertain; not genotypable |
+| **Calibration** | Leave-one-out on the control cells: each control cell's calls are counted only at sites the *other* controls do not carry and that would be reported. The posterior threshold is the lowest whose control false-call rate is <= `--target-fp`; the rate is reported |
+| Reporting | A site is reported when called in >= 2 cells of interest; per-cell calls, the calibration table and a split-read reproducibility check are written out |
 
-| Method | Cell-level precision | Recall | Editing sites called (of 30) | Germline (of 40) | Strand / junction (of 20 each) |
+## Results on real data
+
+**Engineered mutation, FUS P525L knock-in** (Smart-seq2, 50 P525L + 48 control cells): 49/50 carriers called
+mutant, 48/48 controls called wild type. Without being told where to look, scMuta also found the silent T>C
+blocking edit of the knock-in (chr16:31,191,435) in the same 49 cells. The one carrier called wild type has 0
+mutant reads of 7 (likely a mislabelled cell).
+
+**Driver mutation, JAK2 V617F** (TARGET-seq / SMART-seq+ cell lines, Rodriguez-Meira et al. 2019, GSE105451):
+57 SET2 cells called mutant; 0 of 32 Jurkat and HSPC control cells.
+
+**Genome-wide benchmark** (same dataset; `examples/cellline_benchmark.py`). Cells of each line and protocol are
+split at random: one half defines the truth (variants private to SET2 or Jurkat - their germline SNPs and somatic
+mutations - and sites no line carries), the other half is called. Case cells are SET2 + Jurkat mixed; HSPC cells
+are the controls. 4,212 line-private variants, 76,942 covered carrier cell-site pairs, 733,907 sites that must stay
+silent.
+
+| Method | Sensitivity | Precision | False calls | False variant sites | Somatic calls at sites the controls carry |
 |---|---|---|---|---|---|
-| Naive per-cell VAF ≥ 0.2, ≥ 2 alt reads | 0.17 | 0.70 | 30 | 40 | 20 / 20 |
-| scMuta, no negative controls | 0.50 | 0.70 | 30 | 0.2 | 0 / 0 |
-| **scMuta + negative controls** | **0.997** | 0.62 | 0.4 | 0 | 0 / 0 |
+| **scMuta** (threshold chosen by calibration, 0.9) | 59.0% | **97.3%** | 1,254 | 531 | 5,427 |
+| scMuta at 0.999 | 57.5% | **98.7%** | - | **239** | - |
+| >= 2 alt reads, VAF >= 0.1 | 63.9% | 96.8% | 1,651 | 718 | 114,730 |
+| same, sites seen in controls removed | 57.3% | 96.8% | 1,465 | 638 | 8,758 |
+| >= 1 alt read | 77.4% | 10.1% | 530,008 | 213,118 | 162,818 |
 
-Artefact flags remove germline, strand and junction artefacts; **RNA editing is only removed when negative
-controls exist**. Recall is limited by coverage and dropout (truth = mutant cells with ≥ 2 reads), and the
-calibrated threshold trades some recall for precision (`--target-fp`).
+* **Calibration holds on independent truth**: false-positive rate estimated from the controls 5.4e-4, observed
+  in the test cells 4.4e-4.
+* At matched sensitivity scMuta makes ~2.5x fewer false calls and reports ~2.7x fewer false sites than the
+  best threshold rule; results are the same on both protocols (SMART-seq+ / TARGET-seq: sensitivity 59.9% /
+  58.4%, precision 97.0% / 97.5%).
+* Sensitivity follows read depth (18% at 1-2 reads, 51% at 3-5, 68% at 6-10, 84% at > 10): with one or two
+  reads a heterozygous mutation often shows no alt read. 7.3% of covered carrier pairs are called wild type -
+  mostly cells expressing only the reference allele; "wild type" means *the reads support wild type*.
 
-## Usage
+Comparison with SComatic and scAllele on the same cells: `examples/competitors.py` (results to be added).
+
+## Install
 
 ```bash
-pip install -e .
-# plate data (one BAM per cell)
-scmuta call --plate cells.tsv --fasta GRCh38.fa --regions exons.bed --negative control_cells.txt --out out/
-# droplet data
-scmuta call --bam possorted.bam --tag CB --cells barcodes.tsv --stranded --fasta GRCh38.fa \
-            --regions exons.bed --negative control_cells.txt --out out/
-# known sites (e.g. an engineered mutation) with per-cell truth labels
+pip install git+https://github.com/jichanghe/scMuta.git
+# or, for development
+git clone https://github.com/jichanghe/scMuta.git && cd scMuta && pip install -e ".[test]" && pytest -q
+```
+Requires Python >= 3.9, numpy, scipy, pandas, pysam. Linux or macOS.
+
+## Quick start
+
+```bash
+bash examples/quickstart.sh       # builds a tiny synthetic data set and runs scmuta call (< 1 min)
+```
+
+Plate data (one BAM per cell):
+```bash
+scmuta call --plate cells.tsv --fasta GRCh38.fa --regions expressed_exons.bed \
+            --negative control_cells.txt --out out/
+```
+`cells.tsv`: `cell<TAB>path/to/cell.bam` (coordinate-sorted, indexed). `control_cells.txt`: one cell per line.
+
+Droplet data (10x, stranded):
+```bash
+scmuta call --bam possorted_genome_bam.bam --tag CB --cells barcodes.tsv --stranded \
+            --fasta GRCh38.fa --regions expressed_exons.bed --negative control_cells.txt --out out/
+```
+Controls for droplet data are typically cells of another donor (pooled or genotype-demultiplexed samples).
+Runs above `--block-sites` candidates (default 20,000) use the memory-light sparse pipeline automatically.
+
+Known sites only (e.g. an engineered mutation), skipping discovery:
+```bash
 scmuta call --plate cells.tsv --fasta GRCh38.fa --sites known.tsv --truth labels.csv --out out/
 ```
 
-Outputs: `sites.tsv` (flags, error, cells called), `cell_calls.tsv` (cell, site, reads, posterior),
-`calibration.tsv` (threshold vs held-out negative false-call rate), `summary.json`.
+### Outputs
 
-## Roadmap
+| File | Content |
+|---|---|
+| `sites.tsv` | every candidate allele (0-based `pos`): filters, pooled VAF, error rate, mutant VAF, cells called, control calls |
+| `cell_calls.tsv` | cell, site, alt reads, depth, posterior for every mutant call at a reported site |
+| `calibration.tsv` | posterior threshold vs false-call rate in the control cells |
+| `summary.json` | counts, chosen threshold, estimated false-positive rate, filter tallies |
 
-- [x] First real-data truth test: FUS P525L knock-in Smart-seq2 (49/50 carriers, 47/48 controls; found the silent
-      Y526 blocking edit blind) - `examples/fus_p525l.py`
-- [ ] Stray-read (index hopping / cross-contamination) rate per site estimated from negatives
-- [ ] More ground truth:
-      public cell-line mixtures (HapMap / SMaHT), GoT / TARGET-seq data
-- [ ] Germline heterozygous SNPs for allele-specific expression and dropout per cell (SCAN2-style)
-- [ ] Editing modelled as a probability (cluster-wide, A>G context) rather than only screened
-- [ ] Panel of normals across samples; Alu / repeat covariates
-- [ ] Doublet and ambient-RNA terms; clone-level calling (phylogeny-aware)
-- [ ] Speed: parallel per region; sparse matrices for large droplet data
-- [ ] Benchmark vs SComatic, Monopogen, scVar, cellsnp-lite + VAF thresholds
+### Key options
+
+`--target-fp` (default 0.001) false-call rate allowed in controls; `--min-cell-alt` (2) alt reads a cell needs to
+be called mutant; `--min-alt-cells` (2) cells a site needs to be reported; `--editing-bed` known editing sites
+(e.g. REDIportal); `--dedup none|umi|start`; `--stranded` for 10x.
+
+## Reproducing the paper's analyses
+
+| Analysis | Script |
+|---|---|
+| FUS P525L knock-in | `examples/fus_p525l.py` |
+| Known-site truth test (JAK2 V617F) | `examples/known_site_test.py` |
+| Genome-wide cell-line benchmark | `examples/cellline_benchmark.py`, diagnostics `examples/bench_diagnose.py` |
+| SComatic / scAllele comparison | `examples/competitors.py` |
+| Multi-donor 10x snRNA (ALS/FTD motor cortex, GSE174332) | `examples/snrna_pilot.py` |
+| Simulation | `examples/benchmark_sim.py` |
+
+## Limitations
+
+* RNA sees only expressed alleles: monoallelic expression and dropout limit sensitivity, and 3' droplet data
+  cover few positions per cell (e.g. microglia in snRNA are rarely genotypable).
+* With controls from another individual, a mutation present in every case cell cannot be told apart from a
+  germline SNP of that individual (flagged `germline_like`; cell-level calls are still reported).
+* Calibration needs control cells that cannot carry the variants.
+
+## Citation
+
+Ji C. scMuta: calibrated per-cell somatic mutation calling from single-cell RNA sequencing. (in preparation).
+See `CITATION.cff`.
 
 ## Licence
 
