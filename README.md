@@ -3,6 +3,7 @@
 **Per-cell somatic SNV calls from single-cell RNA-seq, with a false-call rate you can trust.**
 
 [![tests](https://github.com/jichanghe/scMuta/actions/workflows/tests.yml/badge.svg)](https://github.com/jichanghe/scMuta/actions/workflows/tests.yml)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23543571.svg)](https://doi.org/10.5281/zenodo.23543571)
 
 Calling mutations in single cells from RNA is dominated by false signals: sequencing and reverse-transcription
 errors, RNA editing, alignment artefacts at read ends and splice junctions, germline SNPs, and allelic dropout.
@@ -133,7 +134,7 @@ be called mutant; `--min-alt-cells` (2) cells a site needs to be reported; `--ed
 ## Citation
 
 Ji C. scMuta: calibrated per-cell somatic mutation calling from single-cell RNA sequencing. (in preparation).
-See `CITATION.cff`.
+Software: Ji C. scMuta 0.1.0. Zenodo. https://doi.org/10.5281/zenodo.23543571. See `CITATION.cff`.
 
 ## Licence
 
