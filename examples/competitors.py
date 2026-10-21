@@ -178,13 +178,33 @@ def scallele(a):
     os.makedirs(out, exist_ok=True)
     log = os.path.join(out, "scallele.log")
     fa = os.path.abspath(a.fasta)
+    regions = [x for x in (a.region_chroms or "").split(",") if x]
     with Timer() as tm:
         for c in tc.run_accession:
             if os.path.exists(os.path.join(out, f"{c}.vcf")):
                 continue
-            sh(f"conda run --no-capture-output -n {a.env} scAllele -b {os.path.abspath(bams[c])} -g {fa} "
-               f"-o {out}/{c} -n {a.threads}", log)
-    save_resources(out, tm, {"tool": "scAllele", "threads": a.threads, "cells": len(tc)})
+            if not regions:
+                sh(f"conda run --no-capture-output -n {a.env} scAllele -b {os.path.abspath(bams[c])} -g {fa} "
+                   f"-o {out}/{c} -n {a.threads}", log)
+                continue
+            # restricted run (scAllele is slow genome-wide): one call per chromosome, VCFs merged per cell
+            parts = []
+            for ch in regions:
+                pre = os.path.join(out, "parts", f"{c}.{ch}")
+                os.makedirs(os.path.dirname(pre), exist_ok=True)
+                if not os.path.exists(pre + ".vcf"):
+                    sh(f"conda run --no-capture-output -n {a.env} scAllele -b {os.path.abspath(bams[c])} -g {fa} "
+                       f"-o {pre} -n {a.threads} -c {ch}", log)
+                parts.append(pre + ".vcf")
+            with open(os.path.join(out, f"{c}.vcf.tmp"), "w") as o:
+                for k, pth in enumerate(parts):
+                    for line in open(pth):
+                        if line.startswith("#") and k > 0:
+                            continue
+                        o.write(line)
+            os.replace(os.path.join(out, f"{c}.vcf.tmp"), os.path.join(out, f"{c}.vcf"))
+    save_resources(out, tm, {"tool": "scAllele", "threads": a.threads, "cells": len(tc),
+                             "chromosomes": regions or "all"})
 
 
 def read_scallele(bench, cells):
@@ -291,11 +311,11 @@ def score(a):
     calls = {}
     sm = pd.read_csv(os.path.join(a.bench, "scmuta", "cell_calls.tsv"), sep="\t")
     calls["scMuta"] = sm[["cell", "chrom", "pos", "alt"]]
-    sc = read_scomatic(a.bench, a.fasta)
+    sc = read_scomatic(a.bench, a.fasta) if "SComatic" not in (a.skip or "") else None
     if sc is not None:
         lt = dict(zip(t.run_accession, t["cell line"]))
         calls["SComatic"] = sc   # expanded to cells below (needs counts)
-    sa = read_scallele(a.bench, tcells)
+    sa = read_scallele(a.bench, tcells) if "scAllele" not in (a.skip or "") else None
     if sa is not None:
         calls["scAllele"] = sa[["cell", "chrom", "pos", "alt"]]
 
@@ -323,6 +343,10 @@ def score(a):
         sites = pd.concat([sites] + [r[2].assign(found_in="competitor") for r in res]).reset_index(drop=True)
 
     lab, _ = cb.truth_labels(A, D, line, truth)
+    if a.chroms_scored:
+        keep_ch = set(a.chroms_scored.split(","))
+        lab = np.where(sites.chrom.isin(keep_ch).to_numpy(), lab, "excluded")
+        print(f"scoring restricted to {sorted(keep_ch)}: {int((lab != 'excluded').sum())} of {len(lab)} sites")
     At, Dt = A[tc_idx].toarray(), D[tc_idx].toarray()
     lt_arr = line[tc_idx]
     case = np.isin(lt_arr, cb.CASE_LINES)
@@ -364,7 +388,9 @@ def score(a):
             for k in ("wall_hours", "cpu_hours", "peak_memory_gb"):
                 tab.loc[tool, k] = r[k]
     out = os.path.join(a.bench, "competitors")
-    tab.to_csv(os.path.join(out, "head_to_head.tsv"), sep="\t")
+    tag = ("_" + a.chroms_scored.replace(",", "_")) if a.chroms_scored else ""
+    os.makedirs(out, exist_ok=True)
+    tab.to_csv(os.path.join(out, f"head_to_head{tag}.tsv"), sep="\t")
     pd.set_option("display.width", 220)
     print(tab.T.to_string())
     print("\nnote: SComatic received the cell-line labels as cell types (its model needs them); the other tools "
@@ -382,6 +408,9 @@ def main():
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--chroms", default=",".join(CHROMS))
     ap.add_argument("--chunk-sites", type=int, default=20000)
+    ap.add_argument("--region-chroms", default=None, help="scallele: run only on these chromosomes (comma list)")
+    ap.add_argument("--chroms-scored", default=None, help="score: only sites on these chromosomes count")
+    ap.add_argument("--skip", default=None, help="score: tools to leave out, e.g. scAllele")
     ap.add_argument("--target-fp", type=float, default=0.001)
     a = ap.parse_args()
     if a.env is None:
