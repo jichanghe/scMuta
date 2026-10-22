@@ -203,9 +203,18 @@ def scallele(a):
             for ch in regions:
                 pre = os.path.join(out, "parts", f"{c}.{ch}")
                 os.makedirs(os.path.dirname(pre), exist_ok=True)
-                if not os.path.exists(pre + ".vcf"):
-                    sh(f"conda run --no-capture-output -n {a.env} scAllele -b {os.path.abspath(bams[c])} -g {fa} "
-                       f"-o {pre} -n {a.threads} -c {ch}", log)
+                if not os.path.exists(pre + ".vcf") or not os.path.exists(pre + ".mi_summary.tab"):
+                    # scAllele occasionally fails on a busy shared drive (a read error mid-run): retry before giving up
+                    for attempt in range(3):
+                        try:
+                            sh(f"conda run --no-capture-output -n {a.env} scAllele -b {os.path.abspath(bams[c])} "
+                               f"-g {fa} -o {pre} -n {a.threads} -c {ch}", log)
+                            break
+                        except subprocess.CalledProcessError:
+                            print(f"scAllele failed on {c} {ch} (attempt {attempt + 1} of 3)", flush=True)
+                            if attempt == 2:
+                                raise
+                            time.sleep(60)
                 parts.append(pre + ".vcf")
             with open(os.path.join(out, f"{c}.vcf.tmp"), "w") as o:
                 for k, pth in enumerate(parts):
