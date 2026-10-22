@@ -154,7 +154,15 @@ def read_scomatic(bench, fasta):
     f = os.path.join(bench, "competitors", "scomatic", "calling", "tseq.calling.step2.tsv")
     if not os.path.exists(f):
         return None
-    df = pd.read_csv(f, sep="\t", dtype=str, comment=None)
+    # SComatic writes "##" metadata lines first, then a "#CHROM ..." header
+    with open(f) as fh:
+        skip = 0
+        for line in fh:
+            if line.startswith("##"):
+                skip += 1
+            else:
+                break
+    df = pd.read_csv(f, sep="\t", dtype=str, skiprows=skip)
     df.columns = [c.lstrip("#") for c in df.columns]
     df = df[df.FILTER == "PASS"]
     fa = pysam.FastaFile(fasta)
