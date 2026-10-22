@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- `scmuta annotate` and `scmuta call --gtf`: gene, region, consequence, codon and protein change from a GTF
+  (checked codon by codon against a brute-force translation on both strands, including split codons).
 - Per-cell genotype EM vectorised over all covered cell-site pairs (identical results, ~5x faster on large
   droplet data; per-site reference implementation kept for tests).
 

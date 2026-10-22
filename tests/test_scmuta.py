@@ -82,3 +82,54 @@ def test_vectorised_em_matches_per_site_loop():
     f = np.isfinite(p1)
     assert np.abs(p1[f] - p2[f]).max() < 1e-9
     assert np.allclose(s1.frac_mutant, s2.frac_mutant) and np.allclose(s1.mutant_vaf, s2.mutant_vaf)
+
+
+def _brute_protein(fa_seq, cds, strand, pos, alt):
+    from scmuta.annotate import CODON, COMP
+    segs = cds if strand == "+" else cds[::-1]
+    def cds_seq(seq):
+        parts = [seq[s:e] for s, e in cds]
+        x = "".join(parts)
+        return x if strand == "+" else x[::-1].translate(COMP)
+    mut = fa_seq[:pos] + alt + fa_seq[pos + 1:]
+    a, b = cds_seq(fa_seq), cds_seq(mut)
+    pa = "".join(CODON[a[i:i + 3]] for i in range(0, len(a) - 2, 3))
+    pb = "".join(CODON[b[i:i + 3]] for i in range(0, len(b) - 2, 3))
+    for i, (x, y) in enumerate(zip(pa, pb)):
+        if x != y:
+            return f"p.{x}{i + 1}{y}"
+    return "syn"
+
+
+def test_annotation_matches_brute_force(tmp_path):
+    import random
+    import pysam
+    from scmuta.annotate import annotate_sites
+    rnd = random.Random(1)
+    seq = "".join(rnd.choice("ACGT") for _ in range(600))
+    (tmp_path / "r.fa").write_text(">chrA\n" + seq + "\n")
+    pysam.faidx(str(tmp_path / "r.fa"))
+    # + strand gene, CDS split across two exons with a codon spanning the junction; - strand gene likewise
+    gtf = [("chrA", "exon", 101, 140, "+", "G1", "T1"), ("chrA", "CDS", 112, 140, "+", "G1", "T1"),
+           ("chrA", "exon", 201, 250, "+", "G1", "T1"), ("chrA", "CDS", 201, 231, "+", "G1", "T1"),
+           ("chrA", "exon", 351, 380, "-", "G2", "T2"), ("chrA", "CDS", 351, 371, "-", "G2", "T2"),
+           ("chrA", "exon", 451, 500, "-", "G2", "T2"), ("chrA", "CDS", 461, 496, "-", "G2", "T2")]
+    with open(tmp_path / "g.gtf", "w") as fh:
+        for c, f, s, e, st, g, t in gtf:
+            fh.write(f'{c}\tt\t{f}\t{s}\t{e}\t.\t{st}\t.\tgene_id "{g}"; transcript_id "{t}"; gene_name "{g}"; '
+                     f'gene_type "protein_coding";\n')
+    cds = {"G1": [(111, 140), (200, 231)], "G2": [(350, 371), (460, 496)]}
+    strand = {"G1": "+", "G2": "-"}
+    pos = list(range(111, 140)) + list(range(200, 231)) + list(range(350, 371)) + list(range(460, 496))
+    rows = [(p, b) for p in pos for b in "ACGT" if b != seq[p]]
+    sites = pd.DataFrame({"chrom": "chrA", "pos": [p for p, _ in rows], "ref": [seq[p] for p, _ in rows],
+                          "alt": [b for _, b in rows]})
+    ann = annotate_sites(sites, str(tmp_path / "g.gtf"), str(tmp_path / "r.fa"))
+    for (p, b), (_, r) in zip(rows, ann.iterrows()):
+        expect = _brute_protein(seq, cds[r.gene], strand[r.gene], p, b)
+        got = r.protein_change if r.consequence != "synonymous" else "syn"
+        assert got == expect, (p, b, r.gene, got, expect)
+    other = annotate_sites(pd.DataFrame({"chrom": ["chrA"] * 4, "pos": [50, 105, 141, 300],
+                                         "ref": [seq[50], seq[105], seq[141], seq[300]], "alt": ["N"] * 4}),
+                           str(tmp_path / "g.gtf"), str(tmp_path / "r.fa"))
+    assert other.region.tolist() == ["intergenic", "5UTR", "splice_site", "intergenic"]

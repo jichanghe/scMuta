@@ -150,19 +150,22 @@ def scomatic(a):
     save_resources(out, tm, {"tool": "SComatic", "threads": a.threads})
 
 
+def _meta_lines(path):
+    """SComatic writes "##" metadata lines first, then a "#CHROM ..." header: how many to skip."""
+    n = 0
+    with open(path) as fh:
+        for line in fh:
+            if not line.startswith("##"):
+                break
+            n += 1
+    return n
+
+
 def read_scomatic(bench, fasta):
     f = os.path.join(bench, "competitors", "scomatic", "calling", "tseq.calling.step2.tsv")
     if not os.path.exists(f):
         return None
-    # SComatic writes "##" metadata lines first, then a "#CHROM ..." header
-    with open(f) as fh:
-        skip = 0
-        for line in fh:
-            if line.startswith("##"):
-                skip += 1
-            else:
-                break
-    df = pd.read_csv(f, sep="\t", dtype=str, skiprows=skip)
+    df = pd.read_csv(f, sep="\t", dtype=str, skiprows=_meta_lines(f))
     df.columns = [c.lstrip("#") for c in df.columns]
     df = df[df.FILTER == "PASS"]
     fa = pysam.FastaFile(fasta)
@@ -351,6 +354,16 @@ def score(a):
         sites = pd.concat([sites] + [r[2].assign(found_in="competitor") for r in res]).reset_index(drop=True)
 
     lab, _ = cb.truth_labels(A, D, line, truth)
+    if a.exclude_pon:
+        # fair subset for somatic callers: drop truth and absent sites at known polymorphic / noisy positions
+        # (SComatic's panel of normals: chrom, 1-based POS)
+        pon = pd.read_csv(a.exclude_pon, sep="\t", usecols=[0, 1], dtype={0: str})
+        pon.columns = ["chrom", "pos1"]
+        pk = set(zip(pon.chrom, pon.pos1.astype(int) - 1))
+        in_pon = np.array([(c, int(p_)) in pk for c, p_ in zip(sites.chrom, sites.pos)])
+        print(f"panel of normals: {int(in_pon.sum())} of {len(in_pon)} sites removed from scoring; truth labels there:",
+              pd.Series(lab[in_pon]).value_counts().to_dict())
+        lab = np.where(in_pon, "excluded", lab)
     if a.chroms_scored:
         keep_ch = set(a.chroms_scored.split(","))
         lab = np.where(sites.chrom.isin(keep_ch).to_numpy(), lab, "excluded")
@@ -370,6 +383,17 @@ def score(a):
                 M[i, j] = True
         return M
 
+    f2 = os.path.join(a.bench, "competitors", "scomatic", "calling", "tseq.calling.step2.tsv")
+    if "SComatic" in calls and os.path.exists(f2):
+        skip = _meta_lines(f2)
+        allsc = pd.read_csv(f2, sep="\t", dtype=str, skiprows=skip, usecols=[0, 1, 5])
+        allsc.columns = ["chrom", "start", "filter"]
+        fk = dict(zip(zip(allsc.chrom, allsc.start.astype(int) - 1), allsc["filter"]))
+        priv = np.flatnonzero(np.char.startswith(lab.astype(str), "private_") & (lab != "private_HSPC"))
+        reasons = pd.Series([fk.get((sites.chrom.iloc[j], int(sites.pos.iloc[j])), "not_in_SComatic_table")
+                             for j in priv]).str.split(";|,").explode().value_counts()
+        print("SComatic FILTER at line-private truth sites (a site can carry several):\n" + reasons.head(15).to_string())
+        reasons.to_csv(os.path.join(a.bench, "competitors", "scomatic_filters_at_truth_sites.tsv"), sep="\t")
     results = []
     for name, df in calls.items():
         if name == "SComatic":
@@ -397,6 +421,7 @@ def score(a):
                 tab.loc[tool, k] = r[k]
     out = os.path.join(a.bench, "competitors")
     tag = ("_" + a.chroms_scored.replace(",", "_")) if a.chroms_scored else ""
+    tag += "_noPoN" if a.exclude_pon else ""
     os.makedirs(out, exist_ok=True)
     tab.to_csv(os.path.join(out, f"head_to_head{tag}.tsv"), sep="\t")
     pd.set_option("display.width", 220)
@@ -419,6 +444,7 @@ def main():
     ap.add_argument("--region-chroms", default=None, help="scallele: run only on these chromosomes (comma list)")
     ap.add_argument("--chroms-scored", default=None, help="score: only sites on these chromosomes count")
     ap.add_argument("--skip", default=None, help="score: tools to leave out, e.g. scAllele")
+    ap.add_argument("--exclude-pon", default=None, help="score: drop sites in this panel of normals (chrom, 1-based pos)")
     ap.add_argument("--target-fp", type=float, default=0.001)
     a = ap.parse_args()
     if a.env is None:

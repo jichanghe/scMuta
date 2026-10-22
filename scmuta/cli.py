@@ -69,11 +69,24 @@ def main(argv=None):
     c.add_argument("--editing-bed", help="known RNA-editing sites (chrom, pos)")
     c.add_argument("--flag-all-ag", action="store_true", help="flag every A>G/T>C as possible editing")
     c.add_argument("--truth", help="optional cell,label CSV (label 1 = carries the variant) for known sites")
+    c.add_argument("--gtf", default=None, help="GTF: annotate reported sites and calls with gene and protein change")
     c.add_argument("--block-sites", type=int, default=20000,
                    help="count this many candidate sites at a time; above one block the memory-light sparse "
                         "pipeline is used (same procedure, for large droplet data)")
     c.add_argument("--out", required=True)
+    an = sub.add_parser("annotate", help="add gene and protein change to any table with chrom, pos (0-based), ref, alt")
+    an.add_argument("--table", required=True, help="e.g. sites.tsv, cell_calls.tsv, somatic_calls.tsv")
+    an.add_argument("--gtf", required=True, help="GENCODE / Ensembl GTF (.gtf or .gtf.gz)")
+    an.add_argument("--fasta", required=True)
+    an.add_argument("--out", required=True)
     a = ap.parse_args(argv)
+    if a.cmd == "annotate":
+        from .annotate import annotate_sites
+        t = pd.read_csv(a.table, sep="\t")
+        res = annotate_sites(t, a.gtf, a.fasta)
+        res.to_csv(a.out, sep="\t", index=False)
+        print(res["consequence"].value_counts().to_string())
+        return 0
 
     rf = ReadFilter(min_mapq=a.min_mapq, min_baseq=a.min_baseq)
     if a.plate:
@@ -132,6 +145,18 @@ def main(argv=None):
         m = {"carriers_covered": int((d.label == 1).sum()), "carriers_called": int(((d.label == 1) & d.called).sum()),
              "noncarriers_covered": int((d.label == 0).sum()), "noncarriers_called": int(((d.label == 0) & d.called).sum())}
         print(json.dumps(m))
+    if a.gtf:
+        from .annotate import annotate_sites
+        for name in ("sites.tsv", "cell_calls.tsv"):
+            pth = os.path.join(a.out, name)
+            t = pd.read_csv(pth, sep="\t")
+            if name == "sites.tsv":
+                t = t[t["variant"]] if "variant" in t.columns else t
+                name = "variants_annotated.tsv"
+            else:
+                name = "cell_calls_annotated.tsv"
+            if len(t):
+                annotate_sites(t, a.gtf, a.fasta).to_csv(os.path.join(a.out, name), sep="\t", index=False)
     print(json.dumps(res["summary"], default=float, indent=1))
     return 0
 

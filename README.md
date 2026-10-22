@@ -106,6 +106,19 @@ scmuta call --plate cells.tsv --fasta GRCh38.fa --sites known.tsv --truth labels
 | `calibration.tsv` | posterior threshold vs false-call rate in the control cells |
 | `summary.json` | counts, chosen threshold, estimated false-positive rate, filter tallies |
 
+### Gene and protein change
+
+Add `--gtf gencode.gtf.gz` to `scmuta call` to write `variants_annotated.tsv` and `cell_calls_annotated.tsv`, or
+annotate any table with `chrom, pos (0-based), ref, alt` afterwards:
+```bash
+scmuta annotate --table out/sites.tsv --gtf gencode.v50.annotation.gtf.gz --fasta GRCh38.fa --out sites_annotated.tsv
+```
+Columns added: `gene`, `gene_type`, `transcript_id` (MANE Select, else Ensembl canonical, else the longest coding
+transcript), `region` (CDS, 5UTR, 3UTR, noncoding_exon, splice_site, intron, intergenic), `consequence`
+(missense, synonymous, stop_gained, stop_lost, start_lost, splice_site, utr, noncoding, intronic, intergenic),
+`codon_change`, `protein_change` (e.g. p.V617F) and `other_genes`. No external tools are needed. For databases
+(gnomAD, ClinVar, COSMIC), pass `variants_annotated.tsv` to Ensembl VEP.
+
 ### Key options
 
 `--target-fp` (default 0.001) false-call rate allowed in controls; `--min-cell-alt` (2) alt reads a cell needs to
