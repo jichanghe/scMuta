@@ -171,6 +171,10 @@ def count(bams, fasta: str, sites: pd.DataFrame, rf: ReadFilter | None = None, t
     for cell, path, t in inputs:
         for region in windows:
             sp = sorted_pos[region[0]]
+            # one molecule can only be seen in the window holding its site (windows are >5000 nt apart, longer
+            # than any read), so the dedup set is cleared per window: over a whole chromosome it would otherwise
+            # grow to one entry per (cell, UMI, site, allele) and exhaust memory on large droplet data
+            seen.clear()
             for cb, r in _iter_reads(path, region, rf, t, keep_cells):
                 # candidate sites inside this read's aligned blocks (most reads in a window cover none): walk the
                 # CIGAR to get their read positions directly; sites outside this window are counted in their own

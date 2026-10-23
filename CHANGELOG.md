@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- Fix: the UMI dedup set in `count()` is cleared per site window instead of growing over a whole chromosome,
+  which exhausted memory on large droplet data (42k nuclei x 180k sites). Counts are unchanged.
 - Head-to-head benchmark against SComatic and scAllele; scoring restricted to a panel of normals or to
   chosen chromosomes; retry on transient read failures.
 - `scmuta annotate` and `scmuta call --gtf`: gene, region, consequence, codon and protein change from a GTF

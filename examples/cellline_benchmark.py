@@ -242,8 +242,10 @@ def main():
     # case cells are a mix of two lines, so a line-private variant is in ~50% of case cells: germline is decided
     # by the controls design here, not by the in-case cell fraction
     filt = SiteFilters(germline_cell_frac=0.95)
+    # store_min=0: the threshold sweep and the wild-type calls below need every covered pair's posterior
     r = run_counts_chunked(At_sp, Dt_sp, st, [cells[i] for i in tc], negative=neg, filters=filt,
-                           target_fp=a.target_fp, min_alt_cells=2, out=os.path.join(a.out, "scmuta"))
+                           target_fp=a.target_fp, min_alt_cells=2, out=os.path.join(a.out, "scmuta"),
+                           store_min=0.0)
     thr = r["summary"]["threshold"]
     var = r["sites"]["variant"].to_numpy()
     pcs, ps = r["posterior_call_sparse"], r["posterior_sparse"]

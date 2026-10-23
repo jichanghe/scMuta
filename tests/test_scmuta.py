@@ -133,3 +133,46 @@ def test_annotation_matches_brute_force(tmp_path):
                                          "ref": [seq[50], seq[105], seq[141], seq[300]], "alt": ["N"] * 4}),
                            str(tmp_path / "g.gtf"), str(tmp_path / "r.fa"))
     assert other.region.tolist() == ["intergenic", "5UTR", "splice_site", "intergenic"]
+
+
+def test_umi_dedup_across_windows(tmp_path):
+    """Molecules are collapsed per (cell, UMI, site) even though the dedup set is cleared per window."""
+    import random
+    import pysam
+    from scmuta.pileup import count
+    rnd = random.Random(0)
+    ref = "".join(rnd.choice("ACGT") for _ in range(400000))
+    fa = tmp_path / "r.fa"
+    fa.write_text(">chrT\n" + "\n".join(ref[i:i + 60] for i in range(0, len(ref), 60)) + "\n")
+    pysam.faidx(str(fa))
+    positions = [1000, 1200, 300000, 300050]          # two windows, >5000 nt apart
+    header = {"HD": {"VN": "1.6", "SO": "coordinate"}, "SQ": [{"LN": len(ref), "SN": "chrT"}]}
+    recs, k = [], 0
+    for cell in ("c1", "c2"):
+        for pos in positions:
+            for umi in range(3):                       # 3 molecules
+                for _ in range(4):                     # each with 4 PCR copies
+                    k += 1
+                    a = pysam.AlignedSegment()
+                    start = pos - 30
+                    seq = list(ref[start:start + 60])
+                    seq[30] = "T" if ref[pos] != "T" else "A"
+                    a.query_name, a.query_sequence, a.flag = f"r{k}", "".join(seq), 0
+                    a.reference_id, a.reference_start, a.mapping_quality = 0, start, 60
+                    a.cigar = [(0, 60)]
+                    a.query_qualities = pysam.qualitystring_to_array("I" * 60)
+                    a.set_tag("NM", 1)
+                    a.set_tag("CB", cell)
+                    a.set_tag("UB", f"{cell}_{pos}_{umi}")
+                    recs.append(a)
+    recs.sort(key=lambda r: r.reference_start)
+    bam = tmp_path / "m.bam"
+    with pysam.AlignmentFile(str(bam), "wb", header=header) as out:
+        for r in recs:
+            out.write(r)
+    pysam.index(str(bam))
+    sites = pd.DataFrame({"chrom": "chrT", "pos": positions, "ref": [ref[p] for p in positions],
+                          "alt": ["T" if ref[p] != "T" else "A" for p in positions]})
+    A, D, s, cells = count(str(bam), str(fa), sites, tag="CB", umi_tag="UB", dedup="umi")
+    assert cells == ["c1", "c2"]
+    assert (A == 3).all(), A

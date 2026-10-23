@@ -134,10 +134,17 @@ def run_counts(A, D, sites, cells, negative=None, filters: SiteFilters | None = 
 
 def run_counts_chunked(A, D, sites, cells, negative, filters: SiteFilters | None = None, target_fp=0.001,
                        min_alt_cells=2, neg_p=1e-3, seed=0, out=None, min_cell_alt=2, min_threshold=0.9,
-                       chunk=1500):
+                       chunk=1500, store_min=None, max_block_bytes=2e8):
     """Memory-light version of run_counts for large sparse data (e.g. 10x snRNA: 10^4-10^5 cells x 10^4-10^5
     sites). A, D: scipy sparse (cells x sites). Sites are processed in blocks; the negative-control calibration is
-    pooled over all blocks before the threshold is chosen, so it is the same procedure as run_counts."""
+    pooled over all blocks before the threshold is chosen, so it is the same procedure as run_counts.
+
+    Memory is bounded two ways, because the posteriors of every covered cell-site pair over a whole chromosome
+    do not fit for large data:
+      store_min       posteriors below this are not kept (they can never be called: the chosen threshold is at
+                      least min_threshold). Default min_threshold. Pass 0.0 to keep them all, which callers
+                      that need the full posterior matrix - a threshold sweep, wild-type calls - must do.
+      max_block_bytes caps the dense working array per block, reducing `chunk` when there are many cells."""
     from scipy import sparse, stats
     A = sparse.csc_matrix(A)
     D = sparse.csc_matrix(D)
@@ -153,6 +160,8 @@ def run_counts_chunked(A, D, sites, cells, negative, filters: SiteFilters | None
     neg_pairs = np.zeros(2)
     blocks = []
     sites = sites.reset_index(drop=True)
+    store_min = min_threshold if store_min is None else store_min
+    chunk = max(100, min(chunk, int(max_block_bytes / max(8 * A.shape[0], 1))))
     # background error per substitution class from ALL sites (so the block size cannot change results)
     a_low, d_low = np.zeros(len(sites)), np.zeros(len(sites))
     for b0 in range(0, len(sites), chunk):
@@ -182,10 +191,12 @@ def run_counts_chunked(A, D, sites, cells, negative, filters: SiteFilters | None
         neg_calls[0] += nc
         neg_pairs[0] += npairs
         s.loc[bad_all & usable, "filter"] = "in_negative_controls"
-        # keep posteriors sparsely (only covered cell-site pairs)
-        rows, cols = np.nonzero(np.isfinite(pc))
+        # keep posteriors sparsely: covered pairs that could still be called at the chosen threshold
+        keep = np.isfinite(pc) & (np.nan_to_num(pc, nan=0) >= store_min)
+        rows, cols = np.nonzero(keep)
         blocks.append((sl, s, sparse.csc_matrix((pc[rows, cols], (rows, cols)), shape=pc.shape),
                        sparse.csc_matrix((post[rows, cols] + 1e-12, (rows, cols)), shape=post.shape)))
+        del a, d, post, pc, keep, rows, cols
         log(f"sites {sl.start}-{sl.stop} of {len(sites)}")
     rate = neg_calls.sum(0) / max(neg_pairs.sum(), 1)
     calib = pd.DataFrame({"threshold": grid, "negative_calls": neg_calls.sum(0).astype(int),
