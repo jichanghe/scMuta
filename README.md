@@ -60,7 +60,37 @@ silent.
   reads a heterozygous mutation often shows no alt read. 7.3% of covered carrier pairs are called wild type -
   mostly cells expressing only the reference allele; "wild type" means *the reads support wild type*.
 
-Comparison with SComatic and scAllele on the same cells: `examples/competitors.py` (results to be added).
+**Compared with other callers** on the same test cells and the same truth (`examples/competitors.py`).
+SComatic was given the cell lines as cell types, which its model requires; the others were not. scAllele was run
+on chromosomes 1 and 19 only, because a genome-wide run takes about an hour per cell, and all methods are scored
+on those two chromosomes in that row.
+
+| Method | Sensitivity | Precision | False calls | False variant sites | Runtime |
+|---|---|---|---|---|---|
+| **scMuta** | **58.3%** | **97.3%** | 1,254 | 531 | **3.2 h** |
+| SComatic | 20.8% | 96.9% | **513** | **183** | 27.5 h |
+| >= 2 alt reads, VAF >= 0.1 | 63.1% | 96.8% | 1,651 | 718 | - |
+| same, sites seen in controls removed | 56.6% | 96.8% | 1,465 | 638 | - |
+
+On chromosomes 1 and 19, where scAllele could also be run (15,897 carrier pairs):
+
+| Method | Sensitivity | Precision | False calls | False variant sites |
+|---|---|---|---|---|
+| **scMuta** | **58.4%** | **96.8%** | 309 | 133 |
+| SComatic | 21.0% | 96.5% | **121** | **39** |
+| scAllele | 45.9% | 59.6% | 4,932 | 4,876 |
+| >= 2 alt reads, VAF >= 0.1 | 62.2% | 96.4% | 366 | 159 |
+| same, sites seen in controls removed | 55.7% | 96.4% | 332 | 144 |
+
+The three fail in different directions. SComatic is conservative: high precision, but it misses four of five
+carrier pairs, and its sensitivity *falls* at high depth (26% above 10 reads, against 84% for scMuta) because its
+panel of normals and noisy-site filters remove the common variants that depth makes visible. scAllele recovers
+variants wherever depth allows (81% above 10 reads) but calls germline and somatic alike, so two of every five
+of its calls are wrong. Restricting the truth set to sites outside SComatic's panel of normals - the fair ground
+for somatic callers - scMuta still made 1.7x more correct calls than SComatic (27,660 against 16,199) at
+comparable precision (96.1% against 96.9%).
+
+Runtimes are from a shared workstation and are indicative only.
 
 ## Install
 

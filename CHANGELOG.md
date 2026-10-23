@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- Head-to-head benchmark against SComatic and scAllele; scoring restricted to a panel of normals or to
+  chosen chromosomes; retry on transient read failures.
 - `scmuta annotate` and `scmuta call --gtf`: gene, region, consequence, codon and protein change from a GTF
   (checked codon by codon against a brute-force translation on both strands, including split codons).
 - Per-cell genotype EM vectorised over all covered cell-site pairs (identical results, ~5x faster on large
