@@ -7,6 +7,6 @@ authors:
 version: 0.2.0
 date-released: 2026-10-25
 license: MIT
-doi: 10.5281/zenodo.23543571
+doi: 10.5281/zenodo.23644689
 repository-code: "https://github.com/jichanghe/scMuta"
 keywords: [single-cell, somatic mutation, variant calling, scRNA-seq, calibration]
