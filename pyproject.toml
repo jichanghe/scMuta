@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scmuta"
-version = "0.1.0"
+version = "0.2.0"
 description = "Calibrated per-cell SNV calling from single-cell RNA-seq: per-cell genotypes with a false-call rate measured on control cells"
 readme = "README.md"
 license = {text = "MIT"}

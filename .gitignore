@@ -4,3 +4,4 @@ build/
 examples/out*/
 scmuta_quickstart/
 .pytest_cache/
+*.bak_*

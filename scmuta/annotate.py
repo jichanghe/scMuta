@@ -81,7 +81,12 @@ def read_gtf(path, chroms=None):
     genes = []
     for gid, ts in by_gene.items():
         t = max(ts, key=rank)
-        genes.append({"chrom": t["chrom"], "start": t["exons"][0][0], "end": t["exons"][-1][1], **t})
+        # the gene spans all its transcripts; positions outside the chosen transcript but inside another isoform are
+        # reported as intronic (or as an exon of another isoform), not intergenic
+        g = {**t, "tx_start": t["exons"][0][0], "tx_end": t["exons"][-1][1],
+             "start": min(x["exons"][0][0] for x in ts), "end": max(x["exons"][-1][1] for x in ts),
+             "other_exons": sorted({e for x in ts if x is not t for e in x["exons"]})}
+        genes.append(g)
     return genes
 
 
@@ -105,6 +110,12 @@ class Annotator:
     def _one(self, g, pos, ref, alt):
         out = {"gene": g["gene"], "gene_id": g["gene_id"], "gene_type": g["gene_type"], "strand": g["strand"],
                "transcript_id": g["id"], "codon_change": "", "protein_change": ""}
+        if not (g.get("tx_start", g["start"]) <= pos < g.get("tx_end", g["end"])):
+            if any(s <= pos < e for s, e in g.get("other_exons", ())):
+                out["region"], out["consequence"] = "exon_other_isoform", "other_isoform"
+            else:
+                out["region"], out["consequence"] = "intron", "intronic"
+            return out
         in_exon = any(s <= pos < e for s, e in g["exons"])
         if not in_exon:
             # within 2 nt of an exon edge, inside the intron = canonical splice site
@@ -168,7 +179,7 @@ class Annotator:
 
     def annotate(self, sites: pd.DataFrame) -> pd.DataFrame:
         order = {"stop_gained": 0, "start_lost": 1, "stop_lost": 2, "missense": 3, "splice_site": 4, "synonymous": 5,
-                 "coding_incomplete": 6, "utr": 7, "noncoding": 8, "intronic": 9}
+                 "coding_incomplete": 6, "utr": 7, "other_isoform": 7, "noncoding": 8, "intronic": 9}
         rows = []
         for c, p, r, a in zip(sites.chrom, sites.pos.astype(int), sites.ref, sites.alt):
             hits = [self._one(g, p, r, a) for g in self.overlapping(c, p)]

@@ -4,8 +4,8 @@ title: "scMuta: calibrated per-cell somatic mutation calling from single-cell RN
 authors:
   - family-names: Ji
     given-names: Changhe
-version: 0.1.0
-date-released: 2026-10-21
+version: 0.2.0
+date-released: 2026-10-25
 license: MIT
 doi: 10.5281/zenodo.23543571
 repository-code: "https://github.com/jichanghe/scMuta"

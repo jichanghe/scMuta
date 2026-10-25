@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 import pysam
 from scipy import io, sparse
+from scipy.stats import binom
 
 from scmuta.model import SiteFilters
 from scmuta.pileup import ReadFilter, count, discover
@@ -108,6 +109,24 @@ def coverage(bam, cells, chroms, step=10, chunk=1_000_000, rf=None):
     return ge1 * step, ge2 * step, pos_cells2
 
 
+def germline_by_molecules(A, D, donor_of, types_of, donor, min_frac=0.15, min_molecules=20, alpha=1e-3):
+    """Sites where, in some cell type of `donor` with >= min_molecules molecules, the alt allele is on >= min_frac of
+    molecules and above the other donors' alt rate (one-sided binomial P < alpha). A, D: nuclei x sites molecule counts."""
+    m = donor_of == donor
+    o = ~m
+    bg = np.maximum(np.asarray(A[o].sum(0)).ravel() / np.maximum(np.asarray(D[o].sum(0)).ravel(), 1), 0.002)
+    out = np.zeros(A.shape[1], bool)
+    for t in set(types_of[m]) - {"unassigned"}:
+        mt = m & (types_of == t)
+        a_t, d_t = np.asarray(A[mt].sum(0)).ravel(), np.asarray(D[mt].sum(0)).ravel()
+        test = (d_t >= min_molecules) & (a_t >= min_frac * d_t)
+        if test.any():
+            pv = np.ones(A.shape[1])
+            pv[test] = binom.sf(a_t[test] - 1, d_t[test], bg[test])
+            out |= test & (pv < alpha)
+    return out
+
+
 def main():
     import functools, builtins
     global print
@@ -119,6 +138,11 @@ def main():
     ap.add_argument("--min-cells-type", type=int, default=30)
     ap.add_argument("--out", default="snrna_pilot")
     ap.add_argument("--editing-bed", default=None, help="known RNA-editing sites (e.g. REDIportal hg38), chrom pos")
+    ap.add_argument("--germline-min-frac", type=float, default=0.15,
+                    help="molecule-level germline test: a site is germline-like in a donor when, in one of its cell types "
+                         "with >= 20 molecules, the alt allele is on at least this fraction of molecules and above the "
+                         "other donors' rate (binomial P < 1e-3); 0 switches the test off, reproducing runs made "
+                         "before it existed")
     ap.add_argument("--min-wt-nuclei", type=int, default=5,
                     help="a somatic call needs >= this many covered (>=2 molecules) wild-type nuclei of the same donor")
     a = ap.parse_args()
@@ -182,7 +206,7 @@ def main():
     As, Ds, cells_all, feats = [], [], [], None
     for d, _ in donors:
         keep = set(meta.barcode[meta.donor == d])
-        A, D, s, cells = count(bams[d], a.fasta, sites, rf, "CB", keep, umi_tag="UB", dedup="umi")
+        A, D, s, cells = count(bams[d], a.fasta, sites, rf, "CB", keep, umi_tag="UB", dedup="umi", sparse_out=True)
         # count() returns only cells with reads at candidate sites, in sorted order; align to all nuclei (sparse:
         # each nucleus covers few sites, so dense cells x sites matrices would not fit in memory)
         A, D = sp.csr_matrix(A), sp.csr_matrix(D)
@@ -226,8 +250,17 @@ def main():
         a_, d_ = np.asarray(A[m].sum(0)).ravel(), np.asarray(D[m].sum(0)).ravel()
         cov_, alt_ = np.asarray((D[m] > 0).sum(0)).ravel(), np.asarray((A[m] > 0).sum(0)).ravel()
         single = (n_types_cov <= 1) & (alt_ >= 0.5 * np.maximum(cov_, 1)) & (a_ >= 0.3 * np.maximum(d_, 1)) & (cov_ >= 3)
-        germ[d] = (n_types_alt >= 2) | single
-        log(f"donor {d}: {germ[d].sum()} germline-like alleles (heterozygous/homozygous SNPs)")
+        by_nuclei = (n_types_alt >= 2) | single
+        # Molecule-level test. 3' snRNA gives about one molecule per nucleus at a site, so a heterozygous SNP shows the
+        # alt allele in only some nuclei and the nucleus-count rules above miss it, above all in genes expressed by one
+        # cell type or with allelic imbalance. Counting molecules instead: an inherited variant puts the alt allele on
+        # a third to a half of a cell type's molecules; a clone would have to occupy over 30% of that type's nuclei to
+        # reach 15%, and with controls from other individuals such a clone cannot be told from a germline SNP anyway.
+        by_molecules = (germline_by_molecules(A, D, donor_of, types_of, d, a.germline_min_frac)
+                        if a.germline_min_frac > 0 else np.zeros(len(sites), bool))
+        germ[d] = by_nuclei | by_molecules
+        log(f"donor {d}: {germ[d].sum()} germline-like alleles (heterozygous/homozygous SNPs; "
+            f"{int((by_molecules & ~by_nuclei).sum())} found only by the molecule-level test)")
 
     results, summary = [], {"candidates": int(len(sites))}
     for d, _ in donors:

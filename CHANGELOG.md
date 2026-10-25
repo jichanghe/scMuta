@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-10-25)
+- `count()` stores allele counts sparsely (`sparse_out=True`) and fetches reads in windows of at most 200 kb or 64
+  candidate sites (`max_window`, `max_sites`), which bounds memory in genes with dense runs of adjacent candidates
+  (chr11 of the motor cortex data previously ran out of memory). Counts do not depend on the window size (tested).
+- `examples/snrna_pilot.py`: molecule-level germline test (`germline_by_molecules`, `--germline-min-frac`) that
+  catches inherited heterozygous variants seen as about one molecule per nucleus.
+- `scmuta annotate`: gene spans and regions use all transcripts of a gene; positions outside the chosen
+  transcript are reported as `intron` or `exon_other_isoform` instead of intergenic.
+- Motor cortex scripts, renamed from the `als_*` drafts: `snrna_summary.py` (detection limit),
+  `snrna_candidates.py`, `snrna_site_check.py` (read-level check, optional plots, `--format pdf`) and
+  `snrna_classify.py` (final calls, Supplementary Table S1); `mem_probe.py`.
 - Fix: the UMI dedup set in `count()` is cleared per site window instead of growing over a whole chromosome,
   which exhausted memory on large droplet data (42k nuclei x 180k sites). Counts are unchanged.
 - Head-to-head benchmark against SComatic and scAllele; scoring restricted to a panel of normals or to

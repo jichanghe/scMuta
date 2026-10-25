@@ -126,7 +126,7 @@ def discover(bams, fasta: str, regions, rf: ReadFilter | None = None, tag: str |
 
 def count(bams, fasta: str, sites: pd.DataFrame, rf: ReadFilter | None = None, tag: str | None = None,
           keep_cells=None, end_window: int = 10, junction_window: int = 3, umi_tag: str | None = None,
-          dedup: str = "none", fast: bool = True):
+          dedup: str = "none", fast: bool = True, sparse_out: bool = False, max_window: int = 200_000, max_sites: int = 64):
     """Pass 2: per-cell ref/alt counts at candidate sites, plus per-site artefact features of alt reads.
 
     dedup: "none"  - count reads
@@ -134,6 +134,15 @@ def count(bams, fasta: str, sites: pd.DataFrame, rf: ReadFilter | None = None, t
            "start" - count distinct (start, strand) per cell, site and allele; a proxy for molecules in
                      plate data without UMIs (removes PCR duplicates that escaped duplicate marking)
     Returns (cells x sites alt matrix, cells x sites depth matrix (ref+alt), site feature table, cell list).
+    max_window caps the length of one fetch window. Windows join candidate sites less than 5 kb apart; on a dense
+    chromosome they would otherwise merge into a few windows tens of Mb long, and the per-window duplicate set,
+    cleared only between windows, would grow until memory ran out. Each site is counted only in the window that holds
+    it, so cutting windows anywhere leaves the counts unchanged. max_sites caps the candidate positions per window for
+    the same reason: in runs of adjacent candidates inside very deep genes (MALAT1, NEAT1 in single-nucleus data)
+    one read covers dozens of sites and the duplicate set grows with reads x sites; smaller windows re-read those
+    reads a few more times but keep memory bounded.
+    sparse_out=True returns the two matrices as scipy CSR (int32). Use it for droplet data: a dense cells x sites
+    table for ~10^4 nuclei and ~10^5 candidate sites takes tens of GB, although almost every entry is zero.
     Plate input (one BAM per cell) uses a fast path: base counts per strand come from htslib
     (count_coverage), and only reads with a mismatch are walked in Python for the artefact features.
     With dedup="start" the fast path keeps the first read per (start, strand) in each cell (the slow path
@@ -149,8 +158,9 @@ def count(bams, fasta: str, sites: pd.DataFrame, rf: ReadFilter | None = None, t
     by_pos = defaultdict(list)
     for i, s in sites.iterrows():
         by_pos[(s.chrom, int(s.pos))].append((i, s.ref, s.alt))
-    alt = defaultdict(int)      # (cell, site) -> alt reads
-    refc = defaultdict(int)     # (cell, site) -> ref reads
+    alt = defaultdict(int)      # (cell, site) -> alt reads, current window
+    refc = defaultdict(int)     # (cell, site) -> ref reads, current window
+    abuf, rbuf, cell_ix = [], [], {}   # finished windows as (cell index, site, count) arrays; cell -> first-seen index
     feat = np.zeros((len(sites), 11))  # alt_fwd, alt_rev, ref_fwd, ref_rev, alt_near_end, alt_near_junction,
     #                                    alt_near_clip, alt_baseq_sum, ref_near_end, ref_near_junction, ref_near_clip
     inputs = _cells_from_inputs(bams, tag)
@@ -161,19 +171,22 @@ def count(bams, fasta: str, sites: pd.DataFrame, rf: ReadFilter | None = None, t
         p = g.pos.to_numpy()
         s0 = p[0]
         prev = p[0]
+        n_in = 1
         for x in p[1:]:
-            if x - prev > 5000:
+            if x - prev > 5000 or x - s0 >= max_window or n_in >= max_sites:
                 windows.append((chrom, int(s0), int(prev) + 1))
                 s0 = x
+                n_in = 0
             prev = x
+            n_in += 1
         windows.append((chrom, int(s0), int(prev) + 1))
     sorted_pos = {c: np.array(sorted({p for (cc, p) in by_pos if cc == c})) for c in sites.chrom.unique()}
     for cell, path, t in inputs:
         for region in windows:
             sp = sorted_pos[region[0]]
-            # one molecule can only be seen in the window holding its site (windows are >5000 nt apart, longer
-            # than any read), so the dedup set is cleared per window: over a whole chromosome it would otherwise
-            # grow to one entry per (cell, UMI, site, allele) and exhaust memory on large droplet data
+            # each site is counted only in the window holding it, so the dedup set (keyed by site) can be cleared
+            # per window; windows are capped at max_window, otherwise on dense chromosomes the set would grow to one
+            # entry per (cell, UMI, site, allele) over tens of Mb and exhaust memory on large droplet data
             seen.clear()
             for cb, r in _iter_reads(path, region, rf, t, keep_cells):
                 # candidate sites inside this read's aligned blocks (most reads in a window cover none): walk the
@@ -230,15 +243,39 @@ def count(bams, fasta: str, sites: pd.DataFrame, rf: ReadFilter | None = None, t
                             feat[i, 8] += near_end
                             feat[i, 9] += near_j
                             feat[i, 10] += near_c
-    cells = sorted({k[0] for k in list(alt) + list(refc)})
-    ci = {c: j for j, c in enumerate(cells)}
-    A = np.zeros((len(cells), len(sites)), np.int32)
-    D = np.zeros((len(cells), len(sites)), np.int32)
-    for (c, i), n in alt.items():
-        A[ci[c], i] += n
-        D[ci[c], i] += n
-    for (c, i), n in refc.items():
-        D[ci[c], i] += n
+            # move this window's counts into compact arrays and empty the dicts: a site belongs to exactly one
+            # window, so nothing counted later can add to these entries (a Python dict entry costs ~200 bytes,
+            # an array entry 12; on a dense chromosome with ~10^4 nuclei the difference is tens of GB)
+            for d_, buf in ((alt, abuf), (refc, rbuf)):
+                if d_:
+                    n = len(d_)
+                    buf.append((np.fromiter((cell_ix.setdefault(c, len(cell_ix)) for c, _ in d_), np.int64, n),
+                                np.fromiter((i for _, i in d_), np.int64, n),
+                                np.fromiter(d_.values(), np.int32, n)))
+                    d_.clear()
+    cells = sorted(cell_ix)
+    order = np.empty(len(cell_ix), np.int64)              # first-seen index -> position in sorted cell list
+    for j, c in enumerate(cells):
+        order[cell_ix[c]] = j
+
+    def _cat(buf):
+        if not buf:
+            return np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0, np.int32)
+        return order[np.concatenate([b[0] for b in buf])], np.concatenate([b[1] for b in buf]), \
+            np.concatenate([b[2] for b in buf])
+    ar, ac, av = _cat(abuf)
+    rr, rc, rv = _cat(rbuf)
+    del abuf, rbuf
+    shape = (len(cells), len(sites))
+    if sparse_out:
+        from scipy import sparse
+        A = sparse.csr_matrix((av, (ar, ac)), shape=shape, dtype=np.int32)
+        D = (A + sparse.csr_matrix((rv, (rr, rc)), shape=shape, dtype=np.int32)).tocsr()
+    else:
+        A = np.zeros(shape, np.int32)
+        np.add.at(A, (ar, ac), av)
+        D = A.copy()
+        np.add.at(D, (rr, rc), rv)
     ref = pysam.FastaFile(fasta)
     ctx, rep = [], []
     for c_, p_, a_ in zip(sites.chrom, sites.pos, sites.alt):

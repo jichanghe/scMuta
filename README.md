@@ -13,7 +13,7 @@ on control cells that cannot carry the variants (another donor, another cell lin
 plate data (Smart-seq2, SMART-seq+, TARGET-seq; one BAM per cell) and droplet data (10x scRNA / snRNA; one BAM
 with a cell-barcode tag).
 
-Status: **0.1.0**, under active development. Interfaces may change before 1.0.
+Status: **0.2.0**, under active development. Interfaces may change before 1.0.
 
 ## How it works
 
@@ -90,6 +90,34 @@ of its calls are wrong. Restricting the truth set to sites outside SComatic's pa
 for somatic callers - scMuta still made 1.7x more correct calls than SComatic (27,660 against 16,199) at
 comparable precision (96.1% against 96.9%).
 
+**Where RNA runs out: 3' snRNA of brain** (motor cortex, GSE174332: 3 C9orf72 FTLD donors and 3 controls; 42,478
+nuclei, 22 autosomes and chrX, 3,031 Mb; `examples/snrna_pilot.py`, `snrna_summary.py`, `snrna_candidates.py`,
+`snrna_site_check.py`, `snrna_classify.py`). 141 sites passed the somatic criteria, 7-61 per donor in proportion to
+each donor's interrogable sequence (r = 0.88); none alters a protein. A read-level test of the donor's *non-carrier*
+nuclei shows that **87 (62%) are inherited variants** (median 39% of their molecules carry the allele) that
+nucleus-count germline rules miss in data this sparse; 28 are artefacts or weak, 17 unresolved, and **9 remain
+candidates** (3 FTLD, 6 control; at most 2.6% of non-carrier molecules), the best an ARHGDIG 3'UTR variant in 8
+excitatory neurons of one control. The calibration also states what could have been found. Median genotypable
+positions per nucleus per chromosome (>= 2 molecules) run from 3,700 in excitatory neurons to 140 in microglia, a
+**26-fold spread**:
+
+| Cell type | Nuclei | Positions/nucleus | Mb detectable, clone at 10% | at 100% |
+|---|---|---|---|---|
+| Excitatory neurons | 10,994 | 3,700 | 2.01 | 18.68 |
+| Interneurons | 983 | 2,160 | 0.12 | 1.69 |
+| Astrocytes | 3,718 | 770 | 0.11 | 2.11 |
+| OPC | 1,713 | 560 | 0.02 | 0.78 |
+| Endothelial | 439 | 500 | 0.01 | 0.40 |
+| Oligodendrocytes | 22,817 | 410 | 0.34 | 6.56 |
+| Microglia | 1,065 | 140 | 0.002 | 0.12 |
+
+Two things follow. The number of calls here **cannot** measure clonal mosaicism: only 0.62% of the sequence examined
+is interrogable even for a clone in *every* nucleus of the best-covered cell type, so the expected number of
+detections is far below one. And because coverage differs 26-fold between cell types, **somatic burden compared
+across cell types in 3' snRNA data tracks coverage unless divided by genotypable positions** - excitatory neurons
+will rank highest whatever the biology. `snrna_summary.py` reports the per-cell-type detection limit for exactly
+this reason.
+
 Runtimes are from a shared workstation and are indicative only.
 
 ## Install
@@ -144,8 +172,8 @@ annotate any table with `chrom, pos (0-based), ref, alt` afterwards:
 scmuta annotate --table out/sites.tsv --gtf gencode.v50.annotation.gtf.gz --fasta GRCh38.fa --out sites_annotated.tsv
 ```
 Columns added: `gene`, `gene_type`, `transcript_id` (MANE Select, else Ensembl canonical, else the longest coding
-transcript), `region` (CDS, 5UTR, 3UTR, noncoding_exon, splice_site, intron, intergenic), `consequence`
-(missense, synonymous, stop_gained, stop_lost, start_lost, splice_site, utr, noncoding, intronic, intergenic),
+transcript), `region` (CDS, 5UTR, 3UTR, noncoding_exon, splice_site, intron, exon_other_isoform, intergenic; a site outside the chosen transcript but inside another isoform of the gene is intron or exon_other_isoform), `consequence`
+(missense, synonymous, stop_gained, stop_lost, start_lost, splice_site, utr, noncoding, other_isoform, intronic, intergenic),
 `codon_change`, `protein_change` (e.g. p.V617F) and `other_genes`. No external tools are needed. For databases
 (gnomAD, ClinVar, COSMIC), pass `variants_annotated.tsv` to Ensembl VEP.
 
@@ -163,13 +191,19 @@ be called mutant; `--min-alt-cells` (2) cells a site needs to be reported; `--ed
 | Known-site truth test (JAK2 V617F) | `examples/known_site_test.py` |
 | Genome-wide cell-line benchmark | `examples/cellline_benchmark.py`, diagnostics `examples/bench_diagnose.py` |
 | SComatic / scAllele comparison | `examples/competitors.py` |
-| Multi-donor 10x snRNA (ALS/FTD motor cortex, GSE174332) | `examples/snrna_pilot.py` |
+| Multi-donor 10x snRNA (motor cortex, C9orf72 FTLD and controls, GSE174332) | `examples/snrna_pilot.py` |
+| Aggregate those runs and compute the clone detection limit | `examples/snrna_summary.py` |
+| Collect and annotate the somatic-supported sites | `examples/snrna_candidates.py`, then `scmuta annotate` |
+| Read-level check per site (molecule counts by nucleus group, optional pyGenomeTracks plots) | `examples/snrna_site_check.py` |
+| Final classification (inherited / candidate / unresolved / artefact; Supplementary Table S1) | `examples/snrna_classify.py` |
+| Memory probe for `count()` on one region | `examples/mem_probe.py` |
 | Simulation | `examples/benchmark_sim.py` |
 
 ## Limitations
 
 * RNA sees only expressed alleles: monoallelic expression and dropout limit sensitivity, and 3' droplet data
-  cover few positions per cell (e.g. microglia in snRNA are rarely genotypable).
+  cover few positions per cell - 3,700 positions per nucleus in excitatory neurons against 140 in microglia, so
+  genome-wide discovery in 3' snRNA is power-limited rather than method-limited (see above).
 * With controls from another individual, a mutation present in every case cell cannot be told apart from a
   germline SNP of that individual (flagged `germline_like`; cell-level calls are still reported).
 * Calibration needs control cells that cannot carry the variants.
@@ -177,7 +211,7 @@ be called mutant; `--min-alt-cells` (2) cells a site needs to be reported; `--ed
 ## Citation
 
 Ji C. scMuta: calibrated per-cell somatic mutation calling from single-cell RNA sequencing. (in preparation).
-Software: Ji C. scMuta 0.1.0. Zenodo. https://doi.org/10.5281/zenodo.23543571. See `CITATION.cff`.
+Software: Ji C. scMuta 0.2.0. Zenodo. DOI of the 0.2.0 release (to be added once Zenodo archives it). See `CITATION.cff`.
 
 ## Licence
 

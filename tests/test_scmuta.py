@@ -135,6 +135,26 @@ def test_annotation_matches_brute_force(tmp_path):
     assert other.region.tolist() == ["intergenic", "5UTR", "splice_site", "intergenic"]
 
 
+def test_annotation_uses_all_isoforms(tmp_path):
+    """A site outside the chosen (MANE) transcript but inside a longer isoform is intronic, not intergenic."""
+    import pysam
+    from scmuta.annotate import annotate_sites
+    seq = "ACGT" * 150
+    (tmp_path / "r.fa").write_text(">chrA\n" + seq + "\n")
+    pysam.faidx(str(tmp_path / "r.fa"))
+    rows = [("exon", 561, 580, "T3a", ' tag "MANE_Select";'), ("CDS", 561, 578, "T3a", ' tag "MANE_Select";'),
+            ("exon", 511, 520, "T3b", ""), ("exon", 571, 590, "T3b", ""), ("CDS", 571, 588, "T3b", "")]
+    with open(tmp_path / "g.gtf", "w") as fh:
+        for f, s, e, tid, tag in rows:
+            fh.write(f'chrA\tt\t{f}\t{s}\t{e}\t.\t+\t.\tgene_id "G3"; transcript_id "{tid}"; gene_name "G3"; '
+                     f'gene_type "protein_coding";{tag}\n')
+    pos = [529, 514, 100]                      # 0-based: T3b intron, T3b-only exon, outside the gene
+    ann = annotate_sites(pd.DataFrame({"chrom": "chrA", "pos": pos, "ref": [seq[p] for p in pos], "alt": "N"}),
+                         str(tmp_path / "g.gtf"), str(tmp_path / "r.fa"))
+    assert ann.region.tolist() == ["intron", "exon_other_isoform", "intergenic"]
+    assert ann.gene.tolist()[:2] == ["G3", "G3"] and ann.transcript_id.tolist()[:2] == ["T3a", "T3a"]
+
+
 def test_umi_dedup_across_windows(tmp_path):
     """Molecules are collapsed per (cell, UMI, site) even though the dedup set is cleared per window."""
     import random
@@ -176,3 +196,103 @@ def test_umi_dedup_across_windows(tmp_path):
     A, D, s, cells = count(str(bam), str(fa), sites, tag="CB", umi_tag="UB", dedup="umi")
     assert cells == ["c1", "c2"]
     assert (A == 3).all(), A
+    # sparse output gives the same counts
+    As, Ds, _, cells_s = count(str(bam), str(fa), sites, tag="CB", umi_tag="UB", dedup="umi", sparse_out=True)
+    assert cells_s == cells and (As.toarray() == A).all() and (Ds.toarray() == D).all()
+
+
+def test_germline_by_molecules():
+    """Inherited het SNP seen as ~1 molecule per nucleus is caught; a small clone and a clean site are not."""
+    import importlib.util, os
+    import numpy as np
+    from scipy import sparse
+    spec = importlib.util.spec_from_file_location("snrna_pilot", os.path.join(os.path.dirname(__file__), "..", "examples", "snrna_pilot.py"))
+    pilot = importlib.util.module_from_spec(spec); spec.loader.exec_module(pilot)
+    rng = np.random.default_rng(0)
+    n1, n2 = 300, 300                                   # donor X nuclei, donor Y nuclei
+    donor = np.array(["X"] * n1 + ["Y"] * n2); types = np.array(["ExN"] * (n1 + n2))
+    D = rng.integers(0, 3, size=(n1 + n2, 3)).astype(float)       # 0-2 molecules per nucleus and site
+    A = np.zeros_like(D)
+    A[:n1, 0] = rng.binomial(D[:n1, 0].astype(int), 0.4)           # site 0: germline het in X, imbalanced (40%)
+    clone = rng.choice(n1, 6, replace=False)
+    A[clone, 1] = D[clone, 1]                                       # site 1: small clone, 6 nuclei of X
+    A[:, 2] = rng.binomial(D[:, 2].astype(int), 0.003)              # site 2: sequencing noise everywhere
+    got = pilot.germline_by_molecules(sparse.csr_matrix(A), sparse.csr_matrix(D), donor, types, "X")
+    assert got.tolist() == [True, False, False]
+
+
+def test_count_independent_of_window_cap(tmp_path):
+    """Dense sites, reads crossing window edges, PCR copies: counts must not depend on how windows are cut."""
+    import random
+    import pysam
+    from scmuta.pileup import count
+    rnd = random.Random(7)
+    ref = "".join(rnd.choice("ACGT") for _ in range(30000))
+    fa = tmp_path / "r.fa"
+    fa.write_text(">chrT\n" + "\n".join(ref[i:i + 60] for i in range(0, len(ref), 60)) + "\n")
+    pysam.faidx(str(fa))
+    positions = list(range(2000, 22000, 37))               # dense: ~540 sites, 37 nt apart
+    alt_of = {p: "T" if ref[p] != "T" else "A" for p in positions}
+    header = {"HD": {"VN": "1.6", "SO": "coordinate"}, "SQ": [{"LN": len(ref), "SN": "chrT"}]}
+    recs, k = [], 0
+    for cell in [f"c{j}" for j in range(12)]:
+        for _ in range(400):
+            start = rnd.randrange(1950, 22000)
+            seq = list(ref[start:start + 90])
+            for p in positions:
+                if start <= p < start + 90 and rnd.random() < 0.3:
+                    seq[p - start] = alt_of[p]
+            umi = f"u{rnd.randrange(150)}"                  # UMI collisions -> duplicates to remove
+            for _copy in range(rnd.choice([1, 2, 3])):
+                k += 1
+                a = pysam.AlignedSegment()
+                a.query_name, a.query_sequence, a.flag = f"r{k}", "".join(seq), 0
+                a.reference_id, a.reference_start, a.mapping_quality = 0, start, 60
+                a.cigar = [(0, 90)]
+                a.query_qualities = pysam.qualitystring_to_array("I" * 90)
+                a.set_tag("NM", 1)
+                a.set_tag("CB", cell)
+                a.set_tag("UB", umi)
+                recs.append(a)
+    recs.sort(key=lambda r: r.reference_start)
+    bam = tmp_path / "d.bam"
+    with pysam.AlignmentFile(str(bam), "wb", header=header) as out:
+        for r in recs:
+            out.write(r)
+    pysam.index(str(bam))
+    sites = pd.DataFrame({"chrom": "chrT", "pos": positions, "ref": [ref[p] for p in positions],
+                          "alt": [alt_of[p] for p in positions]})
+    kw = dict(tag="CB", umi_tag="UB", dedup="umi")
+    A1, D1, s1, c1 = count(str(bam), str(fa), sites, max_window=10 ** 9, **kw)     # one big window
+    A2, D2, s2, c2 = count(str(bam), str(fa), sites, max_window=300, **kw)         # ~70 small windows
+    A3, D3, _, c3 = count(str(bam), str(fa), sites, max_window=300, sparse_out=True, **kw)
+    A4, D4, s4, c4 = count(str(bam), str(fa), sites, max_sites=2, sparse_out=True, **kw)   # 2 sites per window
+    assert c4 == c1 and (A4.toarray() == A1).all() and (D4.toarray() == D1).all()
+    assert c1 == c2 == c3 and A1.sum() > 1000 and (D1 > A1).any()
+    assert (A1 == A2).all() and (D1 == D2).all()
+    assert (A3.toarray() == A1).all() and (D3.toarray() == D1).all()
+    import numpy as np
+    assert np.allclose(s1[["alt_fwd", "ref_fwd"]].to_numpy(), s2[["alt_fwd", "ref_fwd"]].to_numpy())
+
+
+def test_snrna_classify_calls():
+    import importlib.util
+    import pandas as pd
+    spec = importlib.util.spec_from_file_location("snrna_classify", os.path.join(os.path.dirname(__file__), "..", "examples", "snrna_classify.py"))
+    S = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(S)
+    base = dict(chrom="chr1", nuclei=3, mutant_vaf=0.7, vaf_pooled=0.05, negative_cells_called=0, segdup_identity=0.0,
+                carriers_alt_molecules=6, background_alt_fraction_other_donors=0.002, other_donors_same_type_molecules=500,
+                same_donor_other_types_molecules=100, other_types_alt_fraction=0.0, other_types_p_above_background=1.0,
+                noncarrier_alt_fraction=0.0)
+    rows = [dict(base, donor="1", pos=1_000, verdict="germline-like: non-carrier nuclei carry it too", noncarrier_alt_fraction=0.4),
+            dict(base, donor="1", pos=50_000, verdict="consistent with a clone"),
+            dict(base, donor="1", pos=90_000, verdict="consistent with a clone"),       # clustered with the next one
+            dict(base, donor="1", pos=90_010, verdict="consistent with a clone"),
+            dict(base, donor="2", pos=200_000, verdict="consistent with a clone", carriers_alt_molecules=3),  # not replicated
+            dict(base, donor="2", pos=300_000, verdict="unresolved: alt above background in non-carriers", noncarrier_alt_fraction=0.06),
+            dict(base, donor="2", pos=400_000, verdict="unresolved: alt above background in non-carriers",
+                 other_types_alt_fraction=0.3, other_types_p_above_background=1e-6)]   # inherited via other cell types
+    m = S.classify(pd.DataFrame(rows))
+    assert [f[0] for f in m.final] == ["1", "2", "4", "4", "4", "3", "1"]
+    assert "clustered" in m["flags"].iloc[2] and m.tier.iloc[1] == "B"
